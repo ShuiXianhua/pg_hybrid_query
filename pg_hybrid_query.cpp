@@ -1,21 +1,3 @@
-/*
- * ctidscan.c
- *
- * A custom-scan provide that utilizes ctid system column within
- * inequality-operators, to skip block reads never referenced.
- *
- * It is designed to demonstrate Custom Scan APIs; that allows to override
- * a part of executor node. This extension focus on a workload that tries
- * to fetch records with tid larger or less than a particular value.
- * In case when inequality operators were given, this module construct
- * a custom scan path that enables to skip records not to be read. Then,
- * if it was the cheapest one, it shall be used to run the query.
- * Custom Scan APIs callbacks this extension when executor tries to fetch
- * underlying records, then it utilizes existing heap_getnext() but seek
- * the records to be read prior to fetching the first record.
- *
- * Portions Copyright (c) 2014, PostgreSQL Global Development Group
- */
 #include "postgres.h"
 #include "access/relscan.h"
 #include "access/sysattr.h"
@@ -50,52 +32,30 @@
 #include "utils/ruleutils.h"
 #include "utils/spccache.h"
 
-/* missing declaration in pg_proc.h */
-#ifndef TIDGreaterOperator
-#define TIDGreaterOperator		2800
-#endif
-#ifndef TIDLessEqualOperator
-#define TIDLessEqualOperator	2801
-#endif
-#ifndef TIDGreaterEqualOperator
-#define TIDGreaterEqualOperator	2802
-#endif
-
 PG_MODULE_MAGIC;
 
 /*
- * NOTE: We don't use any special data type to save the private data.
- * All we want to save in private fields is expression-list that shall
- * be adjusted by setrefs.c/subselect.c, so we put it on the custom_exprs
- * of CustomScan structure, not custom_private field.
- * Due to the interface contract, only expression nodes are allowed to put
- * on the custom_exprs, and we have to pay attention the core backend may
- * adjust expression items.
- */
-
-/*
- * CtidScanState - state object of ctidscan on executor.
- * It has few additional internal state. The 'ctid_quals' has list of
- * ExprState for inequality operators that involve ctid system column.
+ * HybridQueryState
  */
 typedef struct {
 	CustomScanState	css;
-	List		   *ctid_quals;		/* list of ExprState for inequality ops */
-} CtidScanState;
+} HybridQueryState;
 
 /* static variables */
-static bool		enable_ctidscan;
+static bool		enable_hybridquery;
 static set_rel_pathlist_hook_type set_rel_pathlist_next = NULL;
 
 /* function declarations */
-void	_PG_init(void);
+void _PG_init(void);
+void _PG_fini(void);
 
-static void SetCtidScanPath(PlannerInfo *root,
+static void set_hybridquery_path(PlannerInfo *root,
 							RelOptInfo *rel,
 							Index rti,
 							RangeTblEntry *rte);
+
 /* CustomPathMethods */
-static Plan *PlanCtidScanPath(PlannerInfo *root,
+static Plan *PlanHybridQueryPath(PlannerInfo *root,
 							  RelOptInfo *rel,
 							  CustomPath *best_path,
 							  List *tlist,
@@ -103,34 +63,34 @@ static Plan *PlanCtidScanPath(PlannerInfo *root,
 							  List *custom_plans);
 
 /* CustomScanMethods */
-static Node *CreateCtidScanState(CustomScan *custom_plan);
+static Node *CreateHybridQueryScanState(CustomScan *custom_plan);
 
 /* CustomScanExecMethods */
-static void BeginCtidScan(CustomScanState *node, EState *estate, int eflags);
-static void ReScanCtidScan(CustomScanState *node);
-static TupleTableSlot *ExecCtidScan(CustomScanState *node);
-static void EndCtidScan(CustomScanState *node);
-static void ExplainCtidScan(CustomScanState *node, List *ancestors,
+static void BeginHybridQueryScan(CustomScanState *node, EState *estate, int eflags);
+static TupleTableSlot *ExecHybridQueryScan(CustomScanState *node);
+static void EndHybridQueryScan(CustomScanState *node);
+static void ReScanHybridQueryScan(CustomScanState *node);
+static void ExplainHybridQueryScan(CustomScanState *node, List *ancestors,
 							ExplainState *es);
 
 /* static table of custom-scan callbacks */
-static CustomPathMethods	ctidscan_path_methods = {
-	"ctidscan",				/* CustomName */
-	PlanCtidScanPath,		/* PlanCustomPath */
-	NULL,					/* ReparameterizeCustomPathByChild */
+static CustomPathMethods	hybridquery_path_methods = {
+	"hybridquery",				/* CustomName */
+	PlanHybridQueryPath,		/* PlanCustomPath */
+	NULL,						/* ReparameterizeCustomPathByChild */
 };
 
-static CustomScanMethods	ctidscan_scan_methods = {
-	"ctidscan",				/* CustomName */
-	CreateCtidScanState,	/* CreateCustomScanState */
+static CustomScanMethods	hybridquery_scan_methods = {
+	"hybridquery",				/* CustomName */
+	CreateHybridQueryScanState,	/* CreateCustomScanState */
 };
 
-static CustomExecMethods	ctidscan_exec_methods = {
-	"ctidscan",				/* CustomName */
-	BeginCtidScan,			/* BeginCustomScan */
-	ExecCtidScan,			/* ExecCustomScan */
-	EndCtidScan,			/* EndCustomScan */
-	ReScanCtidScan,			/* ReScanCustomScan */
+static CustomExecMethods	hybridquery_exec_methods = {
+	"hybridquery",				/* CustomName */
+	BeginHybridQueryScan,			/* BeginCustomScan */
+	ExecHybridQueryScan,			/* ExecCustomScan */
+	EndHybridQueryScan,			/* EndCustomScan */
+	ReScanHybridQueryScan,			/* ReScanCustomScan */
 	NULL,					/* MarkPosCustomScan */
 	NULL,					/* RestrPosCustomScan */
 	NULL,					/* EstimateDSMCustomScan */
@@ -138,266 +98,92 @@ static CustomExecMethods	ctidscan_exec_methods = {
 	NULL,					/* ReInitializeDSMCustomScan */
 	NULL,					/* InitializeWorkerCustomScan */
 	NULL,					/* ShutdownCustomScan */
-	ExplainCtidScan,		/* ExplainCustomScan */
+	ExplainHybridQueryScan,		/* ExplainCustomScan */
 };
 
-#define IsCTIDVar(node,rtindex)											\
-	((node) != NULL &&													\
-	 IsA((node), Var) &&												\
-	 ((Var *) (node))->varno == (rtindex) &&							\
-	 ((Var *) (node))->varattno == SelfItemPointerAttributeNumber &&	\
-	 ((Var *) (node))->varlevelsup == 0)
-
-/*
- * CTidQualFromExpr
- *
- * It checks whether the given restriction clauses enables to determine
- * the zone to be scanned, or not. If one or more restriction clauses are
- * available, it returns a list of them, or NIL elsewhere.
- * The caller can consider all the conditions are chained with AND-
- * boolean operator, so all the operator works for narrowing down the
- * scope of custom tid scan.
- */
-static List *
-CTidQualFromExpr(Node *expr, int varno)
+static IndexOptInfo *
+hybridquery_tryfind_annsindex(PlannerInfo *root,
+						  RelOptInfo *baserel)
 {
-	if (is_opclause(expr))
+	IndexOptInfo   *indexOpt = NULL;
+	ListCell	   *cell;
+
+	/* skip if no indexes */
+	if (baserel->indexlist == NIL)
+		return NULL;
+
+	foreach (cell, baserel->indexlist)
 	{
-		OpExpr *op = (OpExpr *) expr;
-		Node   *arg1;
-		Node   *arg2;
-		Node   *other = NULL;
+		IndexOptInfo   *index = (IndexOptInfo *) lfirst(cell);
+		List		   *temp = NIL;
+		ListCell	   *lc;
+		long			nblocks;
 
-		/* only inequality operators are candidate */
-		if (op->opno != TIDLessOperator &&
-			op->opno != TIDLessEqualOperator &&
-			op->opno != TIDGreaterOperator &&
-			op->opno != TIDGreaterEqualOperator)
-			return NULL;
+		/* Protect limited-size array in IndexClauseSets */
+		Assert(index->ncolumns <= INDEX_MAX_KEYS);
 
-		if (list_length(op->args) != 2)
-			return false;	/* should not happen */
+		/* 1016409: pg_hnsw am oid */
+		if (index->relam != 1016409)
+			continue;
 
-		arg1 = linitial(op->args);
-		arg2 = lsecond(op->args);
-
-		if (IsCTIDVar(arg1, varno))
-			other = arg2;
-		else if (IsCTIDVar(arg2, varno))
-			other = arg1;
-		else
-			return NULL;
-		if (exprType(other) != TIDOID)
-			return NULL;	/* should not happen */
-		/* The other argument must be a pseudoconstant */
-		if (!is_pseudo_constant_clause(other))
-			return NULL;
-
-		return list_make1(copyObject(op));
+		indexOpt = index;
 	}
-	else if (and_clause(expr))
-	{
-		List	   *rlst = NIL;
-		ListCell   *lc;
 
-		foreach(lc, ((BoolExpr *) expr)->args)
-		{
-			List   *temp = CTidQualFromExpr((Node *) lfirst(lc), varno);
-
-			rlst = list_concat(rlst, temp);
-		}
-		return rlst;
-	}
-	return NIL;
+	return indexOpt;
 }
 
 /*
- * CTidEstimateCosts
- *
- * It estimates cost to scan the target relation according to the given
- * restriction clauses. Its logic to scan relations are almost same as
- * SeqScan doing, because it uses regular heap_getnext(), except for
- * the number of tuples to be scanned if restriction clauses work well.
-*/
+ * hybridquery_estimate_costs
+ i*/
 static void
-CTidEstimateCosts(PlannerInfo *root,
+hybridquery_estimate_costs(PlannerInfo *root,
 				  RelOptInfo *baserel,
 				  CustomPath *cpath)
 {
 	Path	   *path = &cpath->path;
-	List	   *ctid_quals = cpath->custom_private;
-	ListCell   *lc;
-	double		ntuples;
-	ItemPointerData ip_min;
-	ItemPointerData ip_max;
-	bool		has_min_val = false;
-	bool		has_max_val = false;
-	BlockNumber	num_pages;
-	Cost		startup_cost = 0;
-	Cost		run_cost = 0;
-	Cost		cpu_per_tuple;
-	QualCost	qpqual_cost;
-	QualCost	ctid_qual_cost;
-	double		spc_random_page_cost;
+	// TODO:
+	
+	path->rows = 512;
+	path->startup_cost = 0.0;
+	path->total_cost = 0.0;
+}
 
-	/* Should only be applied to base relations */
-	Assert(baserel->relid > 0);
-	Assert(baserel->rtekind == RTE_RELATION);
+static Path *
+create_hybridquery_path(PlannerInfo *root,
+					RelOptInfo *baserel,
+					IndexOptInfo *indexOpt)
+{
+	CustomPath	   *cpath;
 
-	/* Mark the path with the correct row estimate */
-	if (path->param_info)
-		path->rows = path->param_info->ppi_rows;
-	else
-		path->rows = baserel->rows;
+	cpath = makeNode(CustomPath);
+	cpath->path.pathtype = T_CustomScan;
+	cpath->path.parent = baserel;
+	cpath->path.pathtarget = baserel->reltarget;
+	cpath->path.param_info = get_baserel_parampathinfo(root, baserel,
+										   baserel->lateral_relids);
+	
+	hybridquery_estimate_costs(root, baserel, cpath);
 
-	/* Estimate how many tuples we may retrieve */
-	ItemPointerSet(&ip_min, 0, 0);
-	ItemPointerSet(&ip_max, MaxBlockNumber, MaxOffsetNumber);
-	foreach (lc, ctid_quals)
-	{
-		OpExpr	   *op = lfirst(lc);
-		Oid			opno;
-		Node	   *other;
+	cpath->path.pathkeys = NIL;	/* unsorted results */
+	cpath->flags = 0;
+	cpath->custom_paths = NIL;
+	cpath->custom_private = NIL;
+	cpath->methods = &hybridquery_path_methods;
 
-		Assert(is_opclause(op));
-		if (IsCTIDVar(linitial(op->args), baserel->relid))
-		{
-			opno = op->opno;
-			other = lsecond(op->args);
-		}
-		else if (IsCTIDVar(lsecond(op->args), baserel->relid))
-		{
-			/* To simplifies, we assume as if Var node is 1st argument */
-			opno = get_commutator(op->opno);
-			other = linitial(op->args);
-		}
-		else
-			elog(ERROR, "could not identify CTID variable");
-
-		if (IsA(other, Const))
-		{
-			ItemPointer	ip = (ItemPointer)(((Const *) other)->constvalue);
-
-			/*
-			 * Just an rough estimation, we don't distinct inequality and
-			 * inequality-or-equal operator from scan-size estimation
-			 * perspective.
-			 */
-			switch (opno)
-			{
-				case TIDLessOperator:
-				case TIDLessEqualOperator:
-					if (ItemPointerCompare(ip, &ip_max) < 0)
-						ItemPointerCopy(ip, &ip_max);
-					has_max_val = true;
-					break;
-				case TIDGreaterOperator:
-				case TIDGreaterEqualOperator:
-					if (ItemPointerCompare(ip, &ip_min) > 0)
-						ItemPointerCopy(ip, &ip_min);
-					has_min_val = true;
-					break;
-				default:
-					elog(ERROR, "unexpected operator code: %u", op->opno);
-					break;
-			}
-		}
-	}
-
-	/* estimated number of tuples in this relation */
-	ntuples = baserel->pages * baserel->tuples;
-
-	if (has_min_val && has_max_val)
-	{
-		/* case of both side being bounded */
-		BlockNumber	bnum_max = BlockIdGetBlockNumber(&ip_max.ip_blkid);
-		BlockNumber	bnum_min = BlockIdGetBlockNumber(&ip_min.ip_blkid);
-
-		bnum_max = Min(bnum_max, baserel->pages);
-		bnum_min = Max(bnum_min, 0);
-		num_pages = Min(bnum_max - bnum_min + 1, 1);
-	}
-	else if (has_min_val)
-	{
-		/* case of only lower side being bounded */
-		BlockNumber	bnum_max = baserel->pages;
-		BlockNumber	bnum_min = BlockIdGetBlockNumber(&ip_min.ip_blkid);
-
-		bnum_min = Max(bnum_min, 0);
-		num_pages = Min(bnum_max - bnum_min + 1, 1);
-	}
-	else if (has_max_val)
-	{
-		/* case of only upper side being bounded */
-		BlockNumber	bnum_max = BlockIdGetBlockNumber(&ip_max.ip_blkid);
-		BlockNumber	bnum_min = 0;
-
-		bnum_max = Min(bnum_max, baserel->pages);
-		num_pages = Min(bnum_max - bnum_min + 1, 1);
-	}
-	else
-	{
-		/*
-		 * Just a rough estimation. We assume half of records shall be
-		 * read using this restriction clause, but indeterministic until
-		 * executor run it actually.
-		 */
-		num_pages = Max((baserel->pages + 1) / 2, 1);
-	}
-	ntuples *= ((double) num_pages) / ((double) baserel->pages);
-
-	/*
-	 * The TID qual expressions will be computed once, any other baserestrict
-	 * quals once per retrieved tuple.
-	 */
-	cost_qual_eval(&ctid_qual_cost, ctid_quals, root);
-
-	/* fetch estimated page cost for tablespace containing table */
-	get_tablespace_page_costs(baserel->reltablespace,
-							  &spc_random_page_cost,
-							  NULL);
-
-	/* disk costs --- assume each tuple on a different page */
-	run_cost += spc_random_page_cost * ntuples;
-
-	/*
-	 * Add scanning CPU costs
-	 * (logic copied from get_restriction_qual_cost)
-	 */
-	if (path->param_info)
-	{
-		/* Include costs of pushed-down clauses */
-		cost_qual_eval(&qpqual_cost, path->param_info->ppi_clauses, root);
-
-		qpqual_cost.startup += baserel->baserestrictcost.startup;
-		qpqual_cost.per_tuple += baserel->baserestrictcost.per_tuple;
-	}
-	else
-		qpqual_cost = baserel->baserestrictcost;
-
-	/*
-	 * We don't decrease cost for the inequality operators, because
-	 * it is subset of qpquals and still in.
-	 */
-	startup_cost += qpqual_cost.startup + ctid_qual_cost.per_tuple;
-	cpu_per_tuple = cpu_tuple_cost + qpqual_cost.per_tuple -
-		ctid_qual_cost.per_tuple;
-	run_cost = cpu_per_tuple * ntuples;
-
-	path->startup_cost = startup_cost;
-	path->total_cost = startup_cost + run_cost;
+	return &cpath->path;
 }
 
 /*
- * SetCtidScanPath - entrypoint of the series of custom-scan execution.
- * It adds CustomPath if referenced relation has inequality expressions on
- * the ctid system column.
+ * set_hybridquery_path
  */
 static void
-SetCtidScanPath(PlannerInfo *root, RelOptInfo *baserel,
+set_hybridquery_path(PlannerInfo *root, RelOptInfo *baserel,
 				Index rtindex, RangeTblEntry *rte)
 {
 	char			relkind;
+	IndexOptInfo	*indexOpt;
+	Path			*pathnode;
+
 	ListCell	   *lc;
 	List		   *ctid_quals = NIL;
 
@@ -408,80 +194,31 @@ SetCtidScanPath(PlannerInfo *root, RelOptInfo *baserel,
 	if (relkind != RELKIND_RELATION)
 		return;
 
-	/*
-	 * NOTE: Unlike built-in execution path, always we can have core path
-	 * even though ctid scan is not available. So, simply, we don't add
-	 * any paths, instead of adding disable_cost.
-	 */
-	if (!enable_ctidscan)
+	if (!enable_hybridquery)
 		return;
+	
+	indexOpt = hybridquery_tryfind_annsindex(root, baserel);
 
-	/* walk on the restrict info */
-	foreach (lc, baserel->baserestrictinfo)
-	{
-		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
-		List		 *temp;
+	pathnode = create_hybridquery_path(root, baserel, indexOpt);
 
-		if (!IsA(rinfo, RestrictInfo))
-			continue;		/* probably should never happen */
-		temp = CTidQualFromExpr((Node *) rinfo->clause, baserel->relid);
-		ctid_quals = list_concat(ctid_quals, temp);
-	}
-
-	/*
-	 * OK, it is case when a part of restriction clause makes sense to
-	 * reduce number of tuples, so we will add a custom scan path being
-	 * provided by this module.
-	 */
-	if (ctid_quals != NIL)
-	{
-		CustomPath *cpath;
-		Relids		required_outer;
-
-		/*
-		 * We don't support pushing join clauses into the quals of a ctidscan,
-		 * but it could still have required parameterization due to LATERAL
-		 * refs in its tlist.
-		 */
-		required_outer = baserel->lateral_relids;
-
-		cpath = palloc0(sizeof(CustomPath));
-		cpath->path.type = T_CustomPath;
-		cpath->path.pathtype = T_CustomScan;
-		cpath->path.parent = baserel;
-#if PG_VERSION_NUM >= 90600
-		cpath->path.pathtarget = baserel->reltarget;
-#endif
-		cpath->path.param_info
-			= get_baserel_parampathinfo(root, baserel, required_outer);
-		cpath->flags = CUSTOMPATH_SUPPORT_BACKWARD_SCAN;
-		cpath->custom_private = ctid_quals;
-		cpath->methods = &ctidscan_path_methods;
-
-		CTidEstimateCosts(root, baserel, cpath);
-
-		add_path(baserel, &cpath->path);
-	}
+	add_path(baserel, pathnode);
 }
 
 /*
- * PlanCtidScanPlan - A method of CustomPath; that populate a custom
- * object being delivered from CustomScan type, according to the supplied
- * CustomPath object.
+ * PlanHybridQueryPath
  */
 static Plan *
-PlanCtidScanPath(PlannerInfo *root,
+PlanHybridQueryPath(PlannerInfo *root,
 				 RelOptInfo *rel,
 				 CustomPath *best_path,
 				 List *tlist,
 				 List *clauses,
 				 List *custom_plans)
 {
-	List		   *ctid_quals = best_path->custom_private;
 	CustomScan	   *cscan = makeNode(CustomScan);
 
 	cscan->flags = best_path->flags;
-	cscan->methods = &ctidscan_scan_methods;
+	cscan->methods = &hybridquery_scan_methods;
 
 	/* set scanrelid */
 	cscan->scan.scanrelid = rel->relid;
@@ -489,278 +226,247 @@ PlanCtidScanPath(PlannerInfo *root,
 	cscan->scan.plan.targetlist = tlist;
 	/* reduce RestrictInfo list to bare expressions */
 	cscan->scan.plan.qual = extract_actual_clauses(clauses, false);
-	/* set ctid related quals */
-	cscan->custom_exprs = ctid_quals;
 
 	return &cscan->scan.plan;
 }
 
 /*
- * CreateCtidScanState - A method of CustomScan; that populate a custom
- * object being delivered from CustomScanState type, according to the
- * supplied CustomPath object.
+ * CreateHybridQueryScanState
  */
 static Node *
-CreateCtidScanState(CustomScan *custom_plan)
+CreateHybridQueryScanState(CustomScan *custom_plan)
 {
-	CtidScanState  *ctss = palloc0(sizeof(CtidScanState));
+	HybridQueryState  *hqs = palloc0(sizeof(HybridQueryState));
 
-	NodeSetTag(ctss, T_CustomScanState);
-	ctss->css.flags = custom_plan->flags;
-	ctss->css.methods = &ctidscan_exec_methods;
+	NodeSetTag(hqs, T_CustomScanState);
+	hqs->css.flags = custom_plan->flags;
+	hqs->css.methods = &hybridquery_exec_methods;
 
 	return (Node *)&ctss->css;
 }
 
 /*
- * BeginCtidScan - A method of CustomScanState; that initializes
- * the supplied CtidScanState object, at beginning of the executor.
+ * BeginHybridQueryScan
  */
 static void
-BeginCtidScan(CustomScanState *node, EState *estate, int eflags)
+BeginHybridQueryScan(CustomScanState *node, EState *estate, int eflags)
 {
-	CtidScanState  *ctss = (CtidScanState *) node;
-	CustomScan	   *cscan = (CustomScan *) node->ss.ps.plan;
-
-	/*
-	 * In case of custom-scan provider that offers an alternative way
-	 * to scan a particular relation, most of the needed initialization,
-	 * like relation open or assignment of scan tuple-slot or projection
-	 * info, shall be done by the core implementation. So, all we need
-	 * to have is initialization of own local properties.
-	 */
-	ctss->ctid_quals = (List *)
-		ExecInitExpr((Expr *)cscan->custom_exprs, &node->ss.ps);
+	// TODO:
+	return;
 }
 
 /*
- * ReScanCtidScan - A method of CustomScanState; that rewind the current
- * seek position.
- */
-static void
-ReScanCtidScan(CustomScanState *node)
-{
-	CtidScanState  *ctss = (CtidScanState *)node;
-	HeapScanDesc	scan = ctss->css.ss.ss_currentScanDesc;
-	EState		   *estate = node->ss.ps.state;
-	ScanDirection	direction = estate->es_direction;
-	Relation		relation = ctss->css.ss.ss_currentRelation;
-	ExprContext	   *econtext = ctss->css.ss.ps.ps_ExprContext;
-	ScanKeyData		keys[2];
-	bool			has_ubound = false;
-	bool			has_lbound = false;
-	ItemPointerData	ip_max;
-	ItemPointerData	ip_min;
-	ListCell	   *lc;
-
-	/* once close the existing scandesc, if any */
-	if (scan)
-	{
-		heap_endscan(scan);
-		scan = ctss->css.ss.ss_currentScanDesc = NULL;
-	}
-
-	/* walks on the inequality operators */
-	foreach (lc, ctss->ctid_quals)
-	{
-		FuncExprState  *fexstate = (FuncExprState *) lfirst(lc);
-		OpExpr		   *op = (OpExpr *)fexstate->xprstate.expr;
-		Node		   *arg1 = linitial(op->args);
-		Node		   *arg2 = lsecond(op->args);
-		Index			scanrelid;
-		Oid				opno;
-		ExprState	   *exstate;
-		ItemPointer		itemptr;
-		bool			isnull;
-
-		scanrelid = ((Scan *)ctss->css.ss.ps.plan)->scanrelid;
-		if (IsCTIDVar(arg1, scanrelid))
-		{
-			exstate = (ExprState *) lsecond(fexstate->args);
-			opno = op->opno;
-		}
-		else if (IsCTIDVar(arg2, scanrelid))
-		{
-			exstate = (ExprState *) linitial(fexstate->args);
-			opno = get_commutator(op->opno);
-		}
-		else
-			elog(ERROR, "could not identify CTID variable");
-
-		itemptr = (ItemPointer)
-			DatumGetPointer(ExecEvalExprSwitchContext(exstate,
-													  econtext,
-													  &isnull,
-													  NULL));
-		if (isnull)
-		{
-			/*
-			 * Whole of the restriction clauses chained with AND- boolean
-			 * operators because false, if one of the clauses has NULL result.
-			 * So, we can immediately break the evaluation to inform caller
-			 * it does not make sense to scan any more.
-			 * In this case, scandesc is kept to NULL.
-			 */
-			return;
-		}
-
-		switch (opno)
-		{
-			case TIDLessOperator:
-				if (!has_ubound ||
-					ItemPointerCompare(itemptr, &ip_max) <= 0)
-				{
-					ScanKeyInit(&keys[0],
-								SelfItemPointerAttributeNumber,
-								BTLessStrategyNumber,
-								F_TIDLT,
-								PointerGetDatum(itemptr));
-					ItemPointerCopy(itemptr, &ip_max);
-					has_ubound = true;
-				}
-				break;
-
-			case TIDLessEqualOperator:
-				if (!has_ubound ||
-					ItemPointerCompare(itemptr, &ip_max) < 0)
-				{
-					ScanKeyInit(&keys[0],
-								SelfItemPointerAttributeNumber,
-								BTLessEqualStrategyNumber,
-								F_TIDLE,
-								PointerGetDatum(itemptr));
-					ItemPointerCopy(itemptr, &ip_max);
-					has_ubound = true;
-				}
-				break;
-
-			case TIDGreaterOperator:
-				if (!has_lbound ||
-					ItemPointerCompare(itemptr, &ip_min) >= 0)
-				{
-					ScanKeyInit(&keys[1],
-								SelfItemPointerAttributeNumber,
-								BTGreaterStrategyNumber,
-								F_TIDGT,
-								PointerGetDatum(itemptr));
-					ItemPointerCopy(itemptr, &ip_min);
-					has_lbound = true;
-				}
-				break;
-
-			case TIDGreaterEqualOperator:
-				if (!has_lbound ||
-					ItemPointerCompare(itemptr, &ip_min) > 0)
-				{
-					ScanKeyInit(&keys[1],
-								SelfItemPointerAttributeNumber,
-								BTGreaterEqualStrategyNumber,
-								F_TIDGE,
-								PointerGetDatum(itemptr));
-					ItemPointerCopy(itemptr, &ip_min);
-					has_lbound = true;
-				}
-				break;
-
-			default:
-				elog(ERROR, "unsupported operator");
-				break;
-		}
-	}
-
-	/* begin heapscan with the key above */
-	if (has_ubound && has_lbound)
-		scan = heap_beginscan(relation, estate->es_snapshot, 2, &keys[0]);
-	else if (has_ubound)
-		scan = heap_beginscan(relation, estate->es_snapshot, 1, &keys[0]);
-	else if (has_lbound)
-		scan = heap_beginscan(relation, estate->es_snapshot, 1, &keys[1]);
-	else
-		scan = heap_beginscan(relation, estate->es_snapshot, 0, NULL);
-
-	/* Seek the starting position, if possible */
-	if (direction == ForwardScanDirection && has_lbound)
-	{
-		BlockNumber	blknum = Min(BlockIdGetBlockNumber(&ip_min.ip_blkid),
-								 scan->rs_nblocks - 1);
-		scan->rs_startblock = blknum;
-	}
-	else if (direction == BackwardScanDirection && has_ubound)
-	{
-		BlockNumber	blknum = Min(BlockIdGetBlockNumber(&ip_max.ip_blkid),
-								 scan->rs_nblocks - 1);
-		scan->rs_startblock = blknum;
-	}
-	ctss->css.ss.ss_currentScanDesc = scan;
-}
-
-/*
- * CTidAccessCustomScan
- *
- * Access method of ExecCtidScan below. It fetches a tuple from the underlying
- * heap scan that was  started from the point according to the tid clauses.
+ * HybridQueryAccess
  */
 static TupleTableSlot *
-CTidAccessCustomScan(CustomScanState *node)
+HybridQueryAccess(IndexScanState *node)
 {
-	CtidScanState  *ctss = (CtidScanState *) node;
-	HeapScanDesc	scan;
+	EState	   *estate;
+	ExprContext *econtext;
+	ScanDirection direction;
+	IndexScanDesc scandesc;
+	HeapTuple	tuple;
 	TupleTableSlot *slot;
-	EState		   *estate = node->ss.ps.state;
-	ScanDirection	direction = estate->es_direction;
-	HeapTuple		tuple;
-
-	if (!ctss->css.ss.ss_currentScanDesc)
-		ReScanCtidScan(node);
-	scan = ctss->css.ss.ss_currentScanDesc;
-	Assert(scan != NULL);
 
 	/*
-	 * get the next tuple from the table
+	 * extract necessary information from index scan node
 	 */
-	tuple = heap_getnext(scan, direction);
-	if (!HeapTupleIsValid(tuple))
-		return NULL;
+	estate = node->ss.ps.state;
+	direction = estate->es_direction;
+	/* flip direction if this is an overall backward scan */
+	if (ScanDirectionIsBackward(((IndexScan *) node->ss.ps.plan)->indexorderdir))
+	{
+		if (ScanDirectionIsForward(direction))
+			direction = BackwardScanDirection;
+		else if (ScanDirectionIsBackward(direction))
+			direction = ForwardScanDirection;
+	}
+	scandesc = node->iss_ScanDesc;
+	econtext = node->ss.ps.ps_ExprContext;
+	slot = node->ss.ss_ScanTupleSlot;
 
-	slot = ctss->css.ss.ss_ScanTupleSlot;
-	ExecStoreTuple(tuple, slot, scan->rs_cbuf, false);
+	if (scandesc == NULL)
+	{
+		/*
+		 * We reach here if the index scan is not parallel, or if we're
+		 * serially executing an index scan that was planned to be parallel.
+		 */
+		scandesc = index_beginscan(node->ss.ss_currentRelation,
+								   node->iss_RelationDesc,
+								   estate->es_snapshot,
+								   node->iss_NumScanKeys,
+								   node->iss_NumOrderByKeys);
 
-	return slot;
-}
+		node->iss_ScanDesc = scandesc;
 
-static bool
-CTidRecheckCustomScan(CustomScanState *node, TupleTableSlot *slot)
-{
-	return true;
+		/*
+		 * If no run-time keys to calculate or they are ready, go ahead and
+		 * pass the scankeys to the index AM.
+		 */
+		if (node->iss_NumRuntimeKeys == 0 || node->iss_RuntimeKeysReady)
+			index_rescan(scandesc,
+						 node->iss_ScanKeys, node->iss_NumScanKeys,
+						 node->iss_OrderByKeys, node->iss_NumOrderByKeys);
+	}
+
+	/*
+	 * ok, now that we have what we need, fetch the next tuple.
+	 */
+	while ((tuple = index_getnext(scandesc, direction)) != NULL)
+	{
+		CHECK_FOR_INTERRUPTS();
+
+		/*
+		 * Store the scanned tuple in the scan tuple slot of the scan state.
+		 * Note: we pass 'false' because tuples returned by amgetnext are
+		 * pointers onto disk pages and must not be pfree()'d.
+		 */
+		ExecStoreTuple(tuple,	/* tuple to store */
+					   slot,	/* slot to store in */
+					   scandesc->xs_cbuf,	/* buffer containing tuple */
+					   false);	/* don't pfree */
+
+		/*
+		 * If the index was lossy, we have to recheck the index quals using
+		 * the fetched tuple.
+		 */
+		if (scandesc->xs_recheck)
+		{
+			econtext->ecxt_scantuple = slot;
+			if (!ExecQualAndReset(node->indexqualorig, econtext))
+			{
+				/* Fails recheck, so drop it and loop back for another */
+				InstrCountFiltered2(node, 1);
+				continue;
+			}
+		}
+
+		return slot;
+	}
+
+	/*
+	 * if we get here it means the index scan failed so we are at the end of
+	 * the scan..
+	 */
+	node->iss_ReachedEnd = true;
+	return ExecClearTuple(slot);
 }
 
 /*
- * ExecCtidScan - A method of CustomScanState; that fetches a tuple
- * from the relation, if exist anymore.
+ * HybridQueryRecheck
+ */
+static bool
+HybridQueryRecheck(IndexScanState *node, TupleTableSlot *slot)
+{
+	ExprContext *econtext;
+
+	/*
+	 * extract necessary information from index scan node
+	 */
+	econtext = node->ss.ps.ps_ExprContext;
+
+	/* Does the tuple meet the indexqual condition? */
+	econtext->ecxt_scantuple = slot;
+	return ExecQualAndReset(node->indexqualorig, econtext);
+}
+
+/*
+ * ExecHybridQueryScan
  */
 static TupleTableSlot *
-ExecCtidScan(CustomScanState *node)
+ExecHybridQueryScan(CustomScanState *node)
 {
-	// ExecScan函数和该函数后两个参数accessMth，recheckMtd需要重写
-	// 1. ExecScan函数中，添加对Filter的处理，先得到结构化条件的结果，然后再执行accessMtd做向量搜索；
-	// 2. accessMtd向量搜索中，将第1步中的结构化条件得到的结果传入scandesc的opaque中，在向量搜索扩展中会对opaque中的结构化条件的结果进行处理；
-	// 3. recheckMtd暂无其他处理，返回true。
+	// TODO:
+	// 1. accessMtd参数所指向的函数中，添加对Filter的处理，得到结构化条件的结果，然后将结构化条件得到的结果传入scandesc的opaque中，
+	//    在向量搜索扩展中会对opaque中的结构化条件的结果进行处理；
+	// 2. recheckMtd暂无其他处理，返回true。
 	return ExecScan(&node->ss,
-					(ExecScanAccessMtd) CTidAccessCustomScan,
-					(ExecScanRecheckMtd) CTidRecheckCustomScan);
+					(ExecScanAccessMtd) HybridQueryAccess,
+					(ExecScanRecheckMtd) HybridQueryRecheck);
 }
 
 /*
- * CTidEndCustomScan - A method of CustomScanState; that closes heap and
- * scan descriptor, and release other related resources.
+ * EndHybridQueryScan
  */
 static void
-EndCtidScan(CustomScanState *node)
+EndHybridQueryScan(CustomScanState *node)
 {
-	CtidScanState  *ctss = (CtidScanState *)node;
+	HybridQueryState *hqs = (HybridQueryState *)node;
 
-	if (ctss->css.ss.ss_currentScanDesc)
+	if (hqs->css.ss.ss_currentScanDesc)
 		heap_endscan(ctss->css.ss.ss_currentScanDesc);
+	
+	Relation	indexRelationDesc;
+	IndexScanDesc indexScanDesc;
+	Relation	relation;
+
+	/*
+	 * extract information from the node
+	 */
+	indexRelationDesc = hqs->css.iss_RelationDesc;
+	indexScanDesc = hqs->css.iss_ScanDesc;
+	relation = hqs->css.ss.ss_currentRelation;
+
+	/*
+	 * clear out tuple table slots
+	 */
+	ExecClearTuple(hqs->css.ss.ps.ps_ResultTupleSlot);
+	ExecClearTuple(hqs->css.ss.ss_ScanTupleSlot);
+
+	/*
+	 * close the index relation (no-op if we didn't open it)
+	 */
+	if (indexScanDesc)
+		index_endscan(indexScanDesc);
+	if (indexRelationDesc)
+		index_close(indexRelationDesc, NoLock);
+
+	/*
+	 * close the heap relation.
+	 */
+	ExecCloseScanRelation(relation);
+}
+
+/*
+ * ReScanHybridQueryScan
+ */
+static void
+ReScanHybridQueryScan(CustomScanState *node)
+{
+	node
+	/*
+	 * If we are doing runtime key calculations (ie, any of the index key
+	 * values weren't simple Consts), compute the new key values.  But first,
+	 * reset the context so we don't leak memory as each outer tuple is
+	 * scanned.  Note this assumes that we will recalculate *all* runtime keys
+	 * on each call.
+	 */
+	if (node->iss_NumRuntimeKeys != 0)
+	{
+		ExprContext *econtext = node->iss_RuntimeContext;
+
+		ResetExprContext(econtext);
+		ExecIndexEvalRuntimeKeys(econtext,
+								 node->iss_RuntimeKeys,
+								 node->iss_NumRuntimeKeys);
+	}
+	node->iss_RuntimeKeysReady = true;
+
+	/* flush the reorder queue */
+	if (node->iss_ReorderQueue)
+	{
+		while (!pairingheap_is_empty(node->iss_ReorderQueue))
+			reorderqueue_pop(node);
+	}
+
+	/* reset index scan */
+	if (node->iss_ScanDesc)
+		index_rescan(node->iss_ScanDesc,
+					 node->iss_ScanKeys, node->iss_NumScanKeys,
+					 node->iss_OrderByKeys, node->iss_NumOrderByKeys);
+	node->iss_ReachedEnd = false;
+
+	ExecScanReScan(&node->ss);
 }
 
 /*
@@ -768,33 +474,10 @@ EndCtidScan(CustomScanState *node)
  * on EXPLAIN command.
  */
 static void
-ExplainCtidScan(CustomScanState *node, List *ancestors, ExplainState *es)
+ExplainHybridQueryScan(CustomScanState *node, List *ancestors, ExplainState *es)
 {
-	CtidScanState  *ctss = (CtidScanState *) node;
-	CustomScan	   *cscan = (CustomScan *) ctss->css.ss.ps.plan;
-
-	/* logic copied from show_qual and show_expression */
-	if (cscan->custom_exprs)
-	{
-		bool	useprefix = es->verbose;
-		Node   *qual;
-		List   *context;
-		char   *exprstr;
-
-		/* Convert AND list to explicit AND */
-		qual = (Node *) make_ands_explicit(cscan->custom_exprs);
-
-		/* Set up deparsing context */
-		context = set_deparse_context_planstate(es->deparse_cxt,
-												(Node *) &node->ss.ps,
-                                                ancestors);
-
-		/* Deparse the expression */
-		exprstr = deparse_expression(qual, context, useprefix, false);
-
-		/* And add to es->str */
-		ExplainPropertyText("ctid quals", exprstr, es);
-	}
+	// TODO:
+	return;
 }
 
 /*
@@ -803,10 +486,10 @@ ExplainCtidScan(CustomScanState *node, List *ancestors, ExplainState *es)
 void
 _PG_init(void)
 {
-	DefineCustomBoolVariable("enable_ctidscan",
-							 "Enables the planner's use of ctid-scan plans.",
+	DefineCustomBoolVariable("enable_hybridquery",
+							 "Enables the planner's use of hybrid-query plans.",
 							 NULL,
-							 &enable_ctidscan,
+							 &enable_hybridquery,
 							 true,
 							 PGC_USERSET,
 							 GUC_NOT_IN_SAMPLE,
@@ -814,5 +497,10 @@ _PG_init(void)
 
 	/* registration of the hook to add alternative path */
 	set_rel_pathlist_next = set_rel_pathlist_hook;
-	set_rel_pathlist_hook = SetCtidScanPath;
+	set_rel_pathlist_hook = set_hybridquery_path;
+}
+
+void _PG_fini(void)
+{
+	set_rel_pathlist_hook = NULL;
 }
