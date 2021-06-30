@@ -1,0 +1,181 @@
+(gdb) c
+Continuing.
+c
+Breakpoint 1, SetCtidScanPath (root=0x55c04d044a08, baserel=0x55c04d045090, rtindex=1, rte=0x55c04d010460) at ctidscan.c:407
+407		List		   *ctid_quals = NIL;
+(gdb) bt
+#0  SetCtidScanPath (root=0x55c04d044a08, baserel=0x55c04d045090, rtindex=1, rte=0x55c04d010460) at ctidscan.c:407
+#1  0x000055c04ab94f59 in set_rel_pathlist (root=0x55c04d044a08, rel=0x55c04d045090, rti=1, rte=0x55c04d010460) at allpaths.c:434
+#2  0x000055c04ab94bc6 in set_base_rel_pathlists (root=0x55c04d044a08) at allpaths.c:277
+#3  0x000055c04ab94a07 in make_one_rel (root=0x55c04d044a08, joinlist=0x55c04d045498) at allpaths.c:164
+#4  0x000055c04abbb41b in query_planner (root=0x55c04d044a08, tlist=0x55c04d044c88, qp_callback=0x55c04abc0db9 <standard_qp_callback>, qp_extra=0x7ffc65341ba0) at planmain.c:234
+#5  0x000055c04abbdc77 in grouping_planner (root=0x55c04d044a08, tuple_fraction=0) at planner.c:1563
+#6  0x000055c04abbc29a in subquery_planner (glob=0x55c04d044858, parse=0x55c04d010350, parent_root=0x0, hasRecursion=0 '\000', tuple_fraction=0, subroot=0x7ffc65341d80) at planner.c:630
+#7  0x000055c04abbb6cd in standard_planner (parse=0x55c04d010350, cursorOptions=0, boundParams=0x0) at planner.c:230
+#8  0x000055c04abbb528 in planner (parse=0x55c04d010350, cursorOptions=0, boundParams=0x0) at planner.c:158
+#9  0x000055c04ac7a929 in pg_plan_query (querytree=0x55c04d010350, cursorOptions=0, boundParams=0x0) at postgres.c:824
+#10 0x000055c04ac7a9e0 in pg_plan_queries (querytrees=0x55c04d0449d8, cursorOptions=0, boundParams=0x0) at postgres.c:883
+#11 0x000055c04ac7acf2 in exec_simple_query (query_string=0x55c04d00f118 "select ctid, * from t1 where ctid < '(0, 10)'::tid;") at postgres.c:1048
+#12 0x000055c04ac7f383 in PostgresMain (argc=1, argv=0x55c04cf9e460, dbname=0x55c04cf9e308 "postgres", username=0x55c04cf9e2e8 "postgres") at postgres.c:4078
+#13 0x000055c04ac01bfa in BackendRun (port=0x55c04cfc15f0) at postmaster.c:4316
+#14 0x000055c04ac012af in BackendStartup (port=0x55c04cfc15f0) at postmaster.c:3982
+#15 0x000055c04abfd8a5 in ServerLoop () at postmaster.c:1707
+#16 0x000055c04abfcde0 in PostmasterMain (argc=3, argv=0x55c04cf9d140) at postmaster.c:1315
+#17 0x000055c04ab551f6 in main (argc=3, argv=0x55c04cf9d140) at main.c:228
+(gdb) c
+Continuing.
+
+Breakpoint 2, PlanCtidScanPath (root=0x55c04d044a08, rel=0x55c04d045090, best_path=0x55c04d045308, tlist=0x55c04d062f28, clauses=0x55c04d0458f8, custom_plans=0x0) at ctidscan.c:487
+487		List		   *ctid_quals = best_path->custom_private;
+(gdb) bt
+#0  PlanCtidScanPath (root=0x55c04d044a08, rel=0x55c04d045090, best_path=0x55c04d045308, tlist=0x55c04d062f28, clauses=0x55c04d0458f8, custom_plans=0x0) at ctidscan.c:487
+#1  0x000055c04abb1f8a in create_customscan_plan (root=0x55c04d044a08, best_path=0x55c04d045308, tlist=0x55c04d062f28, scan_clauses=0x55c04d0458f8) at createplan.c:2209
+#2  0x000055c04abaf300 in create_scan_plan (root=0x55c04d044a08, best_path=0x55c04d045308) at createplan.c:435
+#3  0x000055c04abaef4d in create_plan_recurse (root=0x55c04d044a08, best_path=0x55c04d045308) at createplan.c:251
+#4  0x000055c04abaee9b in create_plan (root=0x55c04d044a08, best_path=0x55c04d045308) at createplan.c:209
+#5  0x000055c04abbe53e in grouping_planner (root=0x55c04d044a08, tuple_fraction=0) at planner.c:1846
+#6  0x000055c04abbc29a in subquery_planner (glob=0x55c04d044858, parse=0x55c04d010350, parent_root=0x0, hasRecursion=0 '\000', tuple_fraction=0, subroot=0x7ffc65341d80) at planner.c:630
+#7  0x000055c04abbb6cd in standard_planner (parse=0x55c04d010350, cursorOptions=0, boundParams=0x0) at planner.c:230
+#8  0x000055c04abbb528 in planner (parse=0x55c04d010350, cursorOptions=0, boundParams=0x0) at planner.c:158
+#9  0x000055c04ac7a929 in pg_plan_query (querytree=0x55c04d010350, cursorOptions=0, boundParams=0x0) at postgres.c:824
+#10 0x000055c04ac7a9e0 in pg_plan_queries (querytrees=0x55c04d0449d8, cursorOptions=0, boundParams=0x0) at postgres.c:883
+#11 0x000055c04ac7acf2 in exec_simple_query (query_string=0x55c04d00f118 "select ctid, * from t1 where ctid < '(0, 10)'::tid;") at postgres.c:1048
+#12 0x000055c04ac7f383 in PostgresMain (argc=1, argv=0x55c04cf9e460, dbname=0x55c04cf9e308 "postgres", username=0x55c04cf9e2e8 "postgres") at postgres.c:4078
+#13 0x000055c04ac01bfa in BackendRun (port=0x55c04cfc15f0) at postmaster.c:4316
+#14 0x000055c04ac012af in BackendStartup (port=0x55c04cfc15f0) at postmaster.c:3982
+#15 0x000055c04abfd8a5 in ServerLoop () at postmaster.c:1707
+#16 0x000055c04abfcde0 in PostmasterMain (argc=3, argv=0x55c04cf9d140) at postmaster.c:1315
+#17 0x000055c04ab551f6 in main (argc=3, argv=0x55c04cf9d140) at main.c:228
+(gdb) c
+Continuing.
+
+Breakpoint 3, CreateCtidScanState (custom_plan=0x55c04d0106d0) at ctidscan.c:513
+513		CtidScanState  *ctss = palloc0(sizeof(CtidScanState));
+(gdb) bt
+#0  CreateCtidScanState (custom_plan=0x55c04d0106d0) at ctidscan.c:513
+#1  0x000055c04ab1ba7a in ExecInitCustomScan (cscan=0x55c04d0106d0, estate=0x55c04d04a8d8, eflags=16) at nodeCustom.c:37
+#2  0x000055c04ab040e4 in ExecInitNode (node=0x55c04d0106d0, estate=0x55c04d04a8d8, eflags=16) at execProcnode.c:255
+#3  0x000055c04ab0086a in InitPlan (queryDesc=0x55c04d071728, eflags=16) at execMain.c:958
+#4  0x000055c04aaffb17 in standard_ExecutorStart (queryDesc=0x55c04d071728, eflags=16) at execMain.c:238
+#5  0x000055c04aaff94c in ExecutorStart (queryDesc=0x55c04d071728, eflags=0) at execMain.c:140
+#6  0x000055c04ac80b36 in PortalStart (portal=0x55c04d07ad18, params=0x0, eflags=0, snapshot=0x0) at pquery.c:533
+#7  0x000055c04ac7ad86 in exec_simple_query (query_string=0x55c04d00f118 "select ctid, * from t1 where ctid < '(0, 10)'::tid;") at postgres.c:1080
+#8  0x000055c04ac7f383 in PostgresMain (argc=1, argv=0x55c04cf9e460, dbname=0x55c04cf9e308 "postgres", username=0x55c04cf9e2e8 "postgres") at postgres.c:4078
+#9  0x000055c04ac01bfa in BackendRun (port=0x55c04cfc15f0) at postmaster.c:4316
+#10 0x000055c04ac012af in BackendStartup (port=0x55c04cfc15f0) at postmaster.c:3982
+#11 0x000055c04abfd8a5 in ServerLoop () at postmaster.c:1707
+#12 0x000055c04abfcde0 in PostmasterMain (argc=3, argv=0x55c04cf9d140) at postmaster.c:1315
+#13 0x000055c04ab551f6 in main (argc=3, argv=0x55c04cf9d140) at main.c:228
+(gdb) c
+Continuing.
+
+Breakpoint 4, BeginCtidScan (node=0x55c04d04a9e8, estate=0x55c04d04a8d8, eflags=16) at ctidscan.c:529
+529		CtidScanState  *ctss = (CtidScanState *) node;
+(gdb) bt
+#0  BeginCtidScan (node=0x55c04d04a9e8, estate=0x55c04d04a8d8, eflags=16) at ctidscan.c:529
+#1  0x000055c04ab1bbfe in ExecInitCustomScan (cscan=0x55c04d0106d0, estate=0x55c04d04a8d8, eflags=16) at nodeCustom.c:104
+#2  0x000055c04ab040e4 in ExecInitNode (node=0x55c04d0106d0, estate=0x55c04d04a8d8, eflags=16) at execProcnode.c:255
+#3  0x000055c04ab0086a in InitPlan (queryDesc=0x55c04d071728, eflags=16) at execMain.c:958
+#4  0x000055c04aaffb17 in standard_ExecutorStart (queryDesc=0x55c04d071728, eflags=16) at execMain.c:238
+#5  0x000055c04aaff94c in ExecutorStart (queryDesc=0x55c04d071728, eflags=0) at execMain.c:140
+#6  0x000055c04ac80b36 in PortalStart (portal=0x55c04d07ad18, params=0x0, eflags=0, snapshot=0x0) at pquery.c:533
+#7  0x000055c04ac7ad86 in exec_simple_query (query_string=0x55c04d00f118 "select ctid, * from t1 where ctid < '(0, 10)'::tid;") at postgres.c:1080
+#8  0x000055c04ac7f383 in PostgresMain (argc=1, argv=0x55c04cf9e460, dbname=0x55c04cf9e308 "postgres", username=0x55c04cf9e2e8 "postgres") at postgres.c:4078
+#9  0x000055c04ac01bfa in BackendRun (port=0x55c04cfc15f0) at postmaster.c:4316
+#10 0x000055c04ac012af in BackendStartup (port=0x55c04cfc15f0) at postmaster.c:3982
+#11 0x000055c04abfd8a5 in ServerLoop () at postmaster.c:1707
+#12 0x000055c04abfcde0 in PostmasterMain (argc=3, argv=0x55c04cf9d140) at postmaster.c:1315
+#13 0x000055c04ab551f6 in main (argc=3, argv=0x55c04cf9d140) at main.c:228
+(gdb) c
+Continuing.
+
+Breakpoint 5, ExecCtidScan (node=0x55c04d04a9e8) at ctidscan.c:751
+751		return ExecScan(&node->ss,
+(gdb) bt
+#0  ExecCtidScan (node=0x55c04d04a9e8) at ctidscan.c:751
+#1  0x000055c04ab1bc28 in ExecCustomScan (node=0x55c04d04a9e8) at nodeCustom.c:113
+#2  0x000055c04ab04552 in ExecProcNode (node=0x55c04d04a9e8) at execProcnode.c:462
+#3  0x000055c04ab019d0 in ExecutePlan (estate=0x55c04d04a8d8, planstate=0x55c04d04a9e8, operation=CMD_SELECT, sendTuples=1 '\001', numberTuples=0, direction=ForwardScanDirection, dest=0x55c04d063218) at execMain.c:1550
+#4  0x000055c04aaffc86 in standard_ExecutorRun (queryDesc=0x55c04d071728, direction=ForwardScanDirection, count=0) at execMain.c:338
+#5  0x000055c04aaffb82 in ExecutorRun (queryDesc=0x55c04d071728, direction=ForwardScanDirection, count=0) at execMain.c:286
+#6  0x000055c04ac8148d in PortalRunSelect (portal=0x55c04d07ad18, forward=1 '\001', count=0, dest=0x55c04d063218) at pquery.c:942
+#7  0x000055c04ac81107 in PortalRun (portal=0x55c04d07ad18, count=9223372036854775807, isTopLevel=1 '\001', dest=0x55c04d063218, altdest=0x55c04d063218, completionTag=0x7ffc65341f40 "") at pquery.c:786
+#8  0x000055c04ac7ae6b in exec_simple_query (query_string=0x55c04d00f118 "select ctid, * from t1 where ctid < '(0, 10)'::tid;") at postgres.c:1119
+#9  0x000055c04ac7f383 in PostgresMain (argc=1, argv=0x55c04cf9e460, dbname=0x55c04cf9e308 "postgres", username=0x55c04cf9e2e8 "postgres") at postgres.c:4078
+#10 0x000055c04ac01bfa in BackendRun (port=0x55c04cfc15f0) at postmaster.c:4316
+#11 0x000055c04ac012af in BackendStartup (port=0x55c04cfc15f0) at postmaster.c:3982
+#12 0x000055c04abfd8a5 in ServerLoop () at postmaster.c:1707
+#13 0x000055c04abfcde0 in PostmasterMain (argc=3, argv=0x55c04cf9d140) at postmaster.c:1315
+#14 0x000055c04ab551f6 in main (argc=3, argv=0x55c04cf9d140) at main.c:228
+(gdb) c
+Continuing.
+
+Breakpoint 7, ReScanCtidScan (node=0x55c04d04a9e8) at ctidscan.c:549
+549	{
+(gdb) bt
+#0  ReScanCtidScan (node=0x55c04d04a9e8) at ctidscan.c:549
+#1  0x00007f90873286bc in CTidAccessCustomScan (node=0x55c04d04a9e8) at ctidscan.c:721
+#2  0x000055c04ab0f82f in ExecScanFetch (node=0x55c04d04a9e8, accessMtd=0x7f9087328676 <CTidAccessCustomScan>, recheckMtd=0x7f908732871f <CTidRecheckCustomScan>) at execScan.c:95
+#3  0x000055c04ab0f925 in ExecScan (node=0x55c04d04a9e8, accessMtd=0x7f9087328676 <CTidAccessCustomScan>, recheckMtd=0x7f908732871f <CTidRecheckCustomScan>) at execScan.c:180
+#4  0x00007f9087328758 in ExecCtidScan (node=0x55c04d04a9e8) at ctidscan.c:751
+#5  0x000055c04ab1bc28 in ExecCustomScan (node=0x55c04d04a9e8) at nodeCustom.c:113
+#6  0x000055c04ab04552 in ExecProcNode (node=0x55c04d04a9e8) at execProcnode.c:462
+#7  0x000055c04ab019d0 in ExecutePlan (estate=0x55c04d04a8d8, planstate=0x55c04d04a9e8, operation=CMD_SELECT, sendTuples=1 '\001', numberTuples=0, direction=ForwardScanDirection, dest=0x55c04d063218) at execMain.c:1550
+#8  0x000055c04aaffc86 in standard_ExecutorRun (queryDesc=0x55c04d071728, direction=ForwardScanDirection, count=0) at execMain.c:338
+#9  0x000055c04aaffb82 in ExecutorRun (queryDesc=0x55c04d071728, direction=ForwardScanDirection, count=0) at execMain.c:286
+#10 0x000055c04ac8148d in PortalRunSelect (portal=0x55c04d07ad18, forward=1 '\001', count=0, dest=0x55c04d063218) at pquery.c:942
+#11 0x000055c04ac81107 in PortalRun (portal=0x55c04d07ad18, count=9223372036854775807, isTopLevel=1 '\001', dest=0x55c04d063218, altdest=0x55c04d063218, completionTag=0x7ffc65341f40 "") at pquery.c:786
+#12 0x000055c04ac7ae6b in exec_simple_query (query_string=0x55c04d00f118 "select ctid, * from t1 where ctid < '(0, 10)'::tid;") at postgres.c:1119
+#13 0x000055c04ac7f383 in PostgresMain (argc=1, argv=0x55c04cf9e460, dbname=0x55c04cf9e308 "postgres", username=0x55c04cf9e2e8 "postgres") at postgres.c:4078
+#14 0x000055c04ac01bfa in BackendRun (port=0x55c04cfc15f0) at postmaster.c:4316
+#15 0x000055c04ac012af in BackendStartup (port=0x55c04cfc15f0) at postmaster.c:3982
+#16 0x000055c04abfd8a5 in ServerLoop () at postmaster.c:1707
+#17 0x000055c04abfcde0 in PostmasterMain (argc=3, argv=0x55c04cf9d140) at postmaster.c:1315
+#18 0x000055c04ab551f6 in main (argc=3, argv=0x55c04cf9d140) at main.c:228
+(gdb) c
+Continuing.
+
+Breakpoint 5, ExecCtidScan (node=0x55c04d04a9e8) at ctidscan.c:751
+751		return ExecScan(&node->ss,
+(gdb) bt
+#0  ExecCtidScan (node=0x55c04d04a9e8) at ctidscan.c:751
+#1  0x000055c04ab1bc28 in ExecCustomScan (node=0x55c04d04a9e8) at nodeCustom.c:113
+#2  0x000055c04ab04552 in ExecProcNode (node=0x55c04d04a9e8) at execProcnode.c:462
+#3  0x000055c04ab019d0 in ExecutePlan (estate=0x55c04d04a8d8, planstate=0x55c04d04a9e8, operation=CMD_SELECT, sendTuples=1 '\001', numberTuples=0, direction=ForwardScanDirection, dest=0x55c04d063218) at execMain.c:1550
+#4  0x000055c04aaffc86 in standard_ExecutorRun (queryDesc=0x55c04d071728, direction=ForwardScanDirection, count=0) at execMain.c:338
+#5  0x000055c04aaffb82 in ExecutorRun (queryDesc=0x55c04d071728, direction=ForwardScanDirection, count=0) at execMain.c:286
+#6  0x000055c04ac8148d in PortalRunSelect (portal=0x55c04d07ad18, forward=1 '\001', count=0, dest=0x55c04d063218) at pquery.c:942
+#7  0x000055c04ac81107 in PortalRun (portal=0x55c04d07ad18, count=9223372036854775807, isTopLevel=1 '\001', dest=0x55c04d063218, altdest=0x55c04d063218, completionTag=0x7ffc65341f40 "") at pquery.c:786
+#8  0x000055c04ac7ae6b in exec_simple_query (query_string=0x55c04d00f118 "select ctid, * from t1 where ctid < '(0, 10)'::tid;") at postgres.c:1119
+#9  0x000055c04ac7f383 in PostgresMain (argc=1, argv=0x55c04cf9e460, dbname=0x55c04cf9e308 "postgres", username=0x55c04cf9e2e8 "postgres") at postgres.c:4078
+#10 0x000055c04ac01bfa in BackendRun (port=0x55c04cfc15f0) at postmaster.c:4316
+#11 0x000055c04ac012af in BackendStartup (port=0x55c04cfc15f0) at postmaster.c:3982
+#12 0x000055c04abfd8a5 in ServerLoop () at postmaster.c:1707
+#13 0x000055c04abfcde0 in PostmasterMain (argc=3, argv=0x55c04cf9d140) at postmaster.c:1315
+#14 0x000055c04ab551f6 in main (argc=3, argv=0x55c04cf9d140) at main.c:228
+(gdb) c
+
+Breakpoint 5, ExecCtidScan (node=0x55c04d04a9e8) at ctidscan.c:751
+...
+
+(gdb) c
+Continuing.
+
+Breakpoint 6, EndCtidScan (node=0x55c04d04a9e8) at ctidscan.c:763
+763		CtidScanState  *ctss = (CtidScanState *)node;
+(gdb) bt
+#0  EndCtidScan (node=0x55c04d04a9e8) at ctidscan.c:763
+#1  0x000055c04ab1bc4e in ExecEndCustomScan (node=0x55c04d04a9e8) at nodeCustom.c:120
+#2  0x000055c04ab0499d in ExecEndNode (node=0x55c04d04a9e8) at execProcnode.c:706
+#3  0x000055c04ab01816 in ExecEndPlan (planstate=0x55c04d04a9e8, estate=0x55c04d04a8d8) at execMain.c:1449
+#4  0x000055c04aaffe62 in standard_ExecutorEnd (queryDesc=0x55c04d071728) at execMain.c:467
+#5  0x000055c04aaffe19 in ExecutorEnd (queryDesc=0x55c04d071728) at execMain.c:438
+#6  0x000055c04aab44db in PortalCleanup (portal=0x55c04d07ad18) at portalcmds.c:285
+#7  0x000055c04ae02613 in PortalDrop (portal=0x55c04d07ad18, isTopCommit=0 '\000') at portalmem.c:514
+#8  0x000055c04ac7ae8d in exec_simple_query (query_string=0x55c04d00f118 "select ctid, * from t1 where ctid < '(0, 10)'::tid;") at postgres.c:1128
+#9  0x000055c04ac7f383 in PostgresMain (argc=1, argv=0x55c04cf9e460, dbname=0x55c04cf9e308 "postgres", username=0x55c04cf9e2e8 "postgres") at postgres.c:4078
+#10 0x000055c04ac01bfa in BackendRun (port=0x55c04cfc15f0) at postmaster.c:4316
+#11 0x000055c04ac012af in BackendStartup (port=0x55c04cfc15f0) at postmaster.c:3982
+#12 0x000055c04abfd8a5 in ServerLoop () at postmaster.c:1707
+#13 0x000055c04abfcde0 in PostmasterMain (argc=3, argv=0x55c04cf9d140) at postmaster.c:1315
+#14 0x000055c04ab551f6 in main (argc=3, argv=0x55c04cf9d140) at main.c:228
