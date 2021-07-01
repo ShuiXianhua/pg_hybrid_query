@@ -3,7 +3,7 @@
 MODULE_big = pg_hybrid_query
 
 # pg_hybrid_query
-pg_hybrid_query_OBJS = pg_hybrid_query/pg_hybrid_query.o
+pg_hybrid_query_OBJS = pg_hybrid_query.o
 OBJS += $(pg_hybrid_query_OBJS)
 
 OBJS += $(WIN32RES)
