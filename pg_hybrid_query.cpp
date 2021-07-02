@@ -165,6 +165,37 @@ hybridquery_tryfind_annsindex(PlannerInfo *root,
 	return indexOpt;
 }
 
+static IndexOptInfo *
+hybridquery_tryfind_structuredindex(PlannerInfo *root,
+						  RelOptInfo *baserel)
+{
+	IndexOptInfo   *indexOpt = NULL;
+	ListCell	   *cell;
+
+	/* skip if no indexes */
+	if (baserel->indexlist == NIL)
+		return NULL;
+
+	foreach (cell, baserel->indexlist)
+	{
+		IndexOptInfo   *index = (IndexOptInfo *) lfirst(cell);
+		List		   *temp = NIL;
+		ListCell	   *lc;
+		long			nblocks;
+
+		/* Protect limited-size array in IndexClauseSets */
+		Assert(index->ncolumns <= INDEX_MAX_KEYS);
+
+		/* 16386: pg_ivfpq am oid */
+		if (index->relam != 16386)
+			continue;
+
+		indexOpt = index;
+	}
+
+	return indexOpt;
+}
+
 /*
  * hybridquery_estimate_costs
  i*/
@@ -563,8 +594,8 @@ set_hybridquery_path(PlannerInfo *root, RelOptInfo *baserel,
 	IndexOptInfo	*indexOpt;
 	Path			*pathnode;
 
-	ListCell	   *lc;
-	List		   *ctid_quals = NIL;
+	IndexOptInfo	*quals_indexOpt;
+	Path			*quals_pathnode;
 
 	/* only plain relations are supported */
 	if (rte->rtekind != RTE_RELATION)
@@ -575,6 +606,9 @@ set_hybridquery_path(PlannerInfo *root, RelOptInfo *baserel,
 
 	if (!enable_hybridquery)
 		return;
+	
+	quals_indexOpt = hybridquery_tryfind_structuredindex(root, baserel);
+	quals_pathnode = create_structured_path(root, baserel, quals_indexOpt);
 	
 	indexOpt = hybridquery_tryfind_annsindex(root, baserel);
 
