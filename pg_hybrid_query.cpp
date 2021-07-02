@@ -17,6 +17,7 @@ extern "C"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/nodes.h"
 #include "optimizer/clauses.h"
 #include "optimizer/cost.h"
 #include "optimizer/paths.h"
@@ -63,7 +64,6 @@ typedef struct {
 	Relation	iss_RelationDesc;
 	IndexScanDesc iss_ScanDesc;
 
-	/* These are needed for re-checking ORDER BY expr ordering */
 	pairingheap *iss_ReorderQueue;
 	bool		iss_ReachedEnd;
 	Datum	   *iss_OrderByValues;
@@ -155,8 +155,8 @@ hybridquery_tryfind_annsindex(PlannerInfo *root,
 		/* Protect limited-size array in IndexClauseSets */
 		Assert(index->ncolumns <= INDEX_MAX_KEYS);
 
-		/* 16384: pg_ivfpq am oid */
-		if (index->relam != 16384)
+		/* 16386: pg_ivfpq am oid */
+		if (index->relam != 16386)
 			continue;
 
 		indexOpt = index;
@@ -197,17 +197,6 @@ typedef struct IndexPath
 } IndexPath;
 */
 
-/*
- * Make an approximate estimate of the size of a joinrel.
- *
- * We don't have enough info at this point to get a good estimate, so we
- * just multiply the base relation sizes together.  Fortunately, this is
- * the right answer anyway for the most common case with a single relation
- * on the RHS of a semijoin.  Also, estimate_num_groups() has only a weak
- * dependency on its input_rows argument (it basically uses it as a clamp).
- * So we might be able to get a fairly decent end result even with a severe
- * overestimate of the RHS's raw size.
- */
 static double
 approximate_joinrel_size(PlannerInfo *root, Relids relids)
 {
@@ -1264,8 +1253,9 @@ PlanHybridQueryPath(PlannerInfo *root,
 
 	// 2. 填充CustomScan
 	cscan->scan = indexscan->scan;
+	cscan->scan.plan.type = T_CustomScan;
 	cscan->flags = best_path->flags;
-	cscan->custom_private = list_make1(ipath);  // 保存IndexScan到CustomScan
+	cscan->custom_private = list_make1(indexscan);  // 保存IndexScan到CustomScan
 	cscan->methods = &hybridquery_scan_methods;
 
 	return &cscan->scan.plan;
@@ -1352,7 +1342,7 @@ BeginHybridQueryScan(CustomScanState *css, EState *estate, int eflags)
 	// 完成所提供的CustomScanState的初始化。标准的域已经被ExecInitCustomScan初始化，但是任何私有的域应该在这里被初始化。
 	// 完成HybridQueryState中除CustomScanState的其他成员的初始化
 	HybridQueryIndexScanState *indexstate = (HybridQueryIndexScanState *)((char *)hqs + offsetof(HybridQueryState, is));
-	IndexScan *node = hqs->is;;  // IndexScan
+	IndexScan *node = hqs->is;  // IndexScan
 
 	Relation	currentRelation;
 	bool		relistarget;
