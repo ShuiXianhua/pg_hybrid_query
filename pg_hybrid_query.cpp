@@ -1,7 +1,7 @@
-#ifdef __cplusplus
-extern "C"
-{
-#endif
+// #ifdef __cplusplus
+// extern "C"
+// {
+// #endif
 
 #include "postgres.h"
 #include "access/relscan.h"
@@ -50,6 +50,7 @@ PG_MODULE_MAGIC;
  */
 typedef struct {
 	CustomScanState	css;
+	IndexScan  *quals_is;
 	IndexScan  *is;
 	ExprState  *indexqualorig;
 	List	   *indexorderbyorig;
@@ -135,7 +136,7 @@ static CustomExecMethods	hybridquery_exec_methods = {
 };
 
 static IndexOptInfo *
-hybridquery_tryfind_annsindex(PlannerInfo *root,
+tryfind_anns_index(PlannerInfo *root,
 						  RelOptInfo *baserel)
 {
 	IndexOptInfo   *indexOpt = NULL;
@@ -165,9 +166,121 @@ hybridquery_tryfind_annsindex(PlannerInfo *root,
 	return indexOpt;
 }
 
+/* Data structure for collecting qual clauses that match an index */
+typedef struct
+{
+	bool		nonempty;		/* True if lists are not all empty */
+	/* Lists of RestrictInfos, one per index column */
+	List	   *indexclauses[INDEX_MAX_KEYS];
+} IndexClauseSet;
+
+/*
+ * simple_match_clause_to_indexcol
+ *
+ * It is a simplified version of match_clause_to_indexcol.
+ * Also see optimizer/path/indxpath.c
+ */
+static bool
+simple_match_clause_to_indexcol(IndexOptInfo *index,
+								int indexcol,
+								RestrictInfo *rinfo)
+{
+	Expr	   *clause = rinfo->clause;
+	Index		index_relid = index->rel->relid;
+	Oid			opfamily = index->opfamily[indexcol];
+	Oid			idxcollation = index->indexcollations[indexcol];
+	Node	   *leftop;
+	Node	   *rightop;
+	Relids		left_relids;
+	Relids		right_relids;
+	Oid			expr_op;
+	Oid			expr_coll;
+
+	/* Clause must be a binary opclause */
+	if (!is_opclause(clause))
+		return false;
+
+	leftop = get_leftop(clause);
+	rightop = get_rightop(clause);
+	if (!leftop || !rightop)
+		return false;
+	left_relids = rinfo->left_relids;
+	right_relids = rinfo->right_relids;
+	expr_op = ((OpExpr *) clause)->opno;
+	expr_coll = ((OpExpr *) clause)->inputcollid;
+
+	if (OidIsValid(idxcollation) && idxcollation != expr_coll)
+		return false;
+
+	/*
+	 * Check for clauses of the form:
+	 *    (indexkey operator constant) OR
+	 *    (constant operator indexkey)
+	 */
+	if (match_index_to_operand(leftop, indexcol, index) &&
+		!bms_is_member(index_relid, right_relids) &&
+		!contain_volatile_functions(rightop) &&
+		op_in_opfamily(expr_op, opfamily))
+		return true;
+
+	if (match_index_to_operand(rightop, indexcol, index) &&
+		!bms_is_member(index_relid, left_relids) &&
+		!contain_volatile_functions(leftop) &&
+		op_in_opfamily(get_commutator(expr_op), opfamily))
+		return true;
+
+	return false;
+}
+
+/*
+ * simple_match_clause_to_index
+ *
+ * It is a simplified version of match_clause_to_index.
+ * Also see optimizer/path/indxpath.c
+ */
+static void
+simple_match_clause_to_index(IndexOptInfo *index,
+							 RestrictInfo *rinfo,
+							 IndexClauseSet *clauseset)
+{
+	int		indexcol;
+
+	/*
+	 * Never match pseudoconstants to indexes.  (Normally a match could not
+	 * happen anyway, since a pseudoconstant clause couldn't contain a Var,
+	 * but what if someone builds an expression index on a constant? It's not
+	 * totally unreasonable to do so with a partial index, either.)
+	 */
+	if (rinfo->pseudoconstant)
+		return;
+
+	/*
+	 * If clause can't be used as an indexqual because it must wait till after
+	 * some lower-security-level restriction clause, reject it.
+	 */
+	if (!restriction_is_securely_promotable(rinfo, index->rel))
+		return;
+
+	/* OK, check each index column for a match */
+	for (indexcol = 0; indexcol < index->ncolumns; indexcol++)
+	{
+		if (simple_match_clause_to_indexcol(index,
+											indexcol,
+											rinfo))
+		{
+			clauseset->indexclauses[indexcol] =
+				list_append_unique_ptr(clauseset->indexclauses[indexcol],
+									   rinfo);
+			clauseset->nonempty = true;
+			break;
+		}
+	}
+}
+
 static IndexOptInfo *
-hybridquery_tryfind_structuredindex(PlannerInfo *root,
-						  RelOptInfo *baserel)
+tryfind_structured_index(PlannerInfo *root,
+						  RelOptInfo *baserel,
+						  IndexClauseSet *clauseset)
 {
 	IndexOptInfo   *indexOpt = NULL;
 	ListCell	   *cell;
@@ -179,18 +292,25 @@ hybridquery_tryfind_structuredindex(PlannerInfo *root,
 	foreach (cell, baserel->indexlist)
 	{
 		IndexOptInfo   *index = (IndexOptInfo *) lfirst(cell);
-		List		   *temp = NIL;
 		ListCell	   *lc;
-		long			nblocks;
+		IndexClauseSet rclauseset
 
 		/* Protect limited-size array in IndexClauseSets */
 		Assert(index->ncolumns <= INDEX_MAX_KEYS);
 
-		/* 16386: pg_ivfpq am oid */
-		if (index->relam != 16386)
+		MemSet(&rclauseset, 0, sizeof(rclauseset));
+		foreach (lc, index->indrestrictinfo)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+			simple_match_clause_to_index(index, rinfo, &rclauseset);
+		}
+		if (!rclauseset.nonempty)
 			continue;
 
+
 		indexOpt = index;
+		*clauseset = rclauseset;
 	}
 
 	return indexOpt;
@@ -519,14 +639,11 @@ match_pathkeys_to_index(IndexOptInfo *index, List *pathkeys,
 	*clause_columns_p = clause_columns;
 }
 
-static Path *
+static IndexPath *
 create_hybridquery_path(PlannerInfo *root,
 					RelOptInfo *rel,
 					IndexOptInfo *index)
 {
-	CustomPath	   *cpath;
-
-	// 1. 填充向量索引的IndexPath数据结构
 	List *index_clauses = NULL;
 	List *clause_columns = NULL;
 	List *orderbyclauses;
@@ -564,23 +681,66 @@ create_hybridquery_path(PlannerInfo *root,
 							loop_count,
 							false);
 
-	// 2. 填充CustomPath数据结构，并把上一步得到IndexPath数据结构保存到custom_private成员中
-	cpath = makeNode(CustomPath);
-	cpath->path.pathtype = T_CustomScan;
-	cpath->path.parent = rel;
-	cpath->path.pathtarget = rel->reltarget;
-	cpath->path.param_info = get_baserel_parampathinfo(root, rel,
-										   rel->lateral_relids);
-	
-	hybridquery_estimate_costs(root, rel, cpath);
+	return ipath;
+}
 
-	cpath->path.pathkeys = useful_pathkeys;
-	cpath->flags = 0;
-	cpath->custom_paths = NIL;
-	cpath->custom_private = list_make1(ipath);
-	cpath->methods = &hybridquery_path_methods;
+static IndexPath *
+create_structured_path(PlannerInfo *root,
+					RelOptInfo *rel,
+					IndexOptInfo *index,
+					IndexClauseSet *clauseset)
+{
+	List *index_clauses = NULL;
+	List *clause_columns = NULL;
+	List *orderbyclauses;
+	List *orderbyclausecols;
+	List *useful_pathkeys;
+	Relids outer_relids;
+	double loop_count;
+	bool index_is_ordered;
 
-	return &cpath->path;
+	IndexPath *ipath;
+
+	outer_relids = bms_copy(rel->lateral_relids);
+
+	ListCell   *lc;
+
+	foreach(lc, clauses->indexclauses[0])
+	{
+		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+
+		index_clauses = lappend(index_clauses, rinfo);
+		clause_columns = lappend_int(clause_columns, 0);
+		outer_relids = bms_add_members(outer_relids,
+										rinfo->clause_relids);
+	}
+
+	outer_relids = bms_del_member(outer_relids, rel->relid);
+	if (bms_is_empty(outer_relids))
+		outer_relids = NULL;
+	loop_count = get_loop_count(root, rel->relid, outer_relids);
+
+	index_is_ordered = (index->sortopfamily != NULL);
+
+	useful_pathkeys = NIL;
+	orderbyclauses = NIL;
+	orderbyclausecols = NIL;
+
+	ipath = create_index_path(root, index,
+							index_clauses,
+							clause_columns,
+							orderbyclauses,
+							orderbyclausecols,
+							useful_pathkeys,
+							index_is_ordered ?
+							ForwardScanDirection :
+							NoMovementScanDirection,
+							false,
+							outer_relids,
+							loop_count,
+							false);
+
+	return ipath;
 }
 
 /*
@@ -591,11 +751,15 @@ set_hybridquery_path(PlannerInfo *root, RelOptInfo *baserel,
 				Index rtindex, RangeTblEntry *rte)
 {
 	char			relkind;
+
 	IndexOptInfo	*indexOpt;
-	Path			*pathnode;
+	IndexPath		*pathnode;
 
 	IndexOptInfo	*quals_indexOpt;
-	Path			*quals_pathnode;
+	IndexClauseSet 	clauseset;
+	IndexPath		*quals_pathnode;
+
+	CustomPath		*cpath;
 
 	/* only plain relations are supported */
 	if (rte->rtekind != RTE_RELATION)
@@ -607,14 +771,31 @@ set_hybridquery_path(PlannerInfo *root, RelOptInfo *baserel,
 	if (!enable_hybridquery)
 		return;
 	
-	quals_indexOpt = hybridquery_tryfind_structuredindex(root, baserel);
-	quals_pathnode = create_structured_path(root, baserel, quals_indexOpt);
+	// 1. 结构化索引
+	quals_indexOpt = tryfind_structured_index(root, baserel, &clauseset);
+	quals_pathnode = create_structured_path(root, baserel, quals_indexOpt, &clauseset);
 	
-	indexOpt = hybridquery_tryfind_annsindex(root, baserel);
-
+	// 2. 向量索引
+	indexOpt = tryfind_anns_index(root, baserel);
 	pathnode = create_hybridquery_path(root, baserel, indexOpt);
 
-	add_path(baserel, pathnode);
+	// 3. 填充CustomPath数据结构，并把上一步得到IndexPath数据结构保存到custom_private成员中
+	cpath = makeNode(CustomPath);
+	cpath->path.pathtype = T_CustomScan;
+	cpath->path.parent = baserel;
+	cpath->path.pathtarget = baserel->reltarget;
+	cpath->path.param_info = get_baserel_parampathinfo(root, baserel,
+										   baserel->lateral_relids);
+	
+	hybridquery_estimate_costs(root, baserel, cpath);
+
+	cpath->path.pathkeys = root->query_pathkeys;
+	cpath->flags = 0;
+	cpath->custom_paths = list_make1(quals_pathnode);
+	cpath->custom_private = list_make1(pathnode);
+	cpath->methods = &hybridquery_path_methods;
+
+	add_path(baserel, &cpath->path);  // 其实就是传递的CustomPath的指针，只是为了达到类似C++的多态效果
 }
 
 static Node *
@@ -1278,7 +1459,12 @@ PlanHybridQueryPath(PlannerInfo *root,
 				 List *custom_plans)
 {
 	CustomScan	   *cscan = makeNode(CustomScan);
+
+	IndexPath *quals_ipath = (IndexPath *) lfirst(list_head(best_path->custom_paths));
 	IndexPath *ipath = (IndexPath *) lfirst(list_head(best_path->custom_private));
+
+	IndexScan *quals_indexscan;
+	quals_indexscan = (IndexScan *)hybridquery_create_indexscan_plan(root, quals_ipath, tlist, clauses, false);
 
 	// 1. 以createplan.c中create_indexscan_plan函数的方式，调用make_indexscan创建Scan对象（实际上是Plan的子类），
 	// make_indexscan函数需要的参数存放在CustomPath中，而CustomPath会在create_hybridquery_path被填充。
@@ -1289,10 +1475,11 @@ PlanHybridQueryPath(PlannerInfo *root,
 	cscan->scan = indexscan->scan;
 	cscan->scan.plan.type = T_CustomScan;
 	cscan->flags = best_path->flags;
+	cscan->custom_plans = list_make1(quals_indexscan);  // 保存结构化索引的IndexScan到CustomScan
 	cscan->custom_private = list_make1(indexscan);  // 保存IndexScan到CustomScan
 	cscan->methods = &hybridquery_scan_methods;
 
-	return &cscan->scan.plan;
+	return &cscan->scan.plan;  // 其实就是返回CustomScan的指针，只是为了达到类似C++的多态效果
 }
 
 /*
@@ -1307,6 +1494,7 @@ CreateHybridQueryScanState(CustomScan *custom_plan)
 	hqs->css.flags = custom_plan->flags;
 	hqs->css.methods = &hybridquery_exec_methods;
 
+	hqs->quals_is = (IndexScan *) lfirst(list_head(custom_plan->custom_plans));
 	hqs->is = (IndexScan *) lfirst(list_head(custom_plan->custom_private));
 
 	return (Node *)&hqs->css;
@@ -1727,6 +1915,6 @@ void _PG_fini(void)
 	set_rel_pathlist_hook = NULL;
 }
 
-#ifdef __cplusplus
-}
-#endif
+// #ifdef __cplusplus
+// }
+// #endif
