@@ -1,7 +1,7 @@
-// #ifdef __cplusplus
-// extern "C"
-// {
-// #endif
+#ifdef __cplusplus
+extern "C"
+{
+#endif
 
 #include "postgres.h"
 #include "access/relscan.h"
@@ -51,7 +51,9 @@ PG_MODULE_MAGIC;
 typedef struct {
 	CustomScanState	css;
 	IndexScan  *quals_is;
-	IndexScan  *is;
+	IndexScan  *anns_is;
+	IndexScanState *quals_iss;
+	IndexScanState *anns_iss;
 	ExprState  *indexqualorig;
 	List	   *indexorderbyorig;
 	ScanKey		iss_ScanKeys;
@@ -293,7 +295,7 @@ tryfind_structured_index(PlannerInfo *root,
 	{
 		IndexOptInfo   *index = (IndexOptInfo *) lfirst(cell);
 		ListCell	   *lc;
-		IndexClauseSet rclauseset
+		IndexClauseSet rclauseset;
 
 		/* Protect limited-size array in IndexClauseSets */
 		Assert(index->ncolumns <= INDEX_MAX_KEYS);
@@ -705,7 +707,7 @@ create_structured_path(PlannerInfo *root,
 
 	ListCell   *lc;
 
-	foreach(lc, clauses->indexclauses[0])
+	foreach(lc, clauseset->indexclauses[0])
 	{
 		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
 
@@ -752,12 +754,12 @@ set_hybridquery_path(PlannerInfo *root, RelOptInfo *baserel,
 {
 	char			relkind;
 
-	IndexOptInfo	*indexOpt;
-	IndexPath		*pathnode;
+	IndexOptInfo	*anns_indexOpt;
+	IndexPath		*anns_pathnode;
 
 	IndexOptInfo	*quals_indexOpt;
-	IndexClauseSet 	clauseset;
 	IndexPath		*quals_pathnode;
+	IndexClauseSet 	clauseset;
 
 	CustomPath		*cpath;
 
@@ -776,8 +778,8 @@ set_hybridquery_path(PlannerInfo *root, RelOptInfo *baserel,
 	quals_pathnode = create_structured_path(root, baserel, quals_indexOpt, &clauseset);
 	
 	// 2. 向量索引
-	indexOpt = tryfind_anns_index(root, baserel);
-	pathnode = create_hybridquery_path(root, baserel, indexOpt);
+	anns_indexOpt = tryfind_anns_index(root, baserel);
+	anns_pathnode = create_hybridquery_path(root, baserel, anns_indexOpt);
 
 	// 3. 填充CustomPath数据结构，并把上一步得到IndexPath数据结构保存到custom_private成员中
 	cpath = makeNode(CustomPath);
@@ -792,7 +794,7 @@ set_hybridquery_path(PlannerInfo *root, RelOptInfo *baserel,
 	cpath->path.pathkeys = root->query_pathkeys;
 	cpath->flags = 0;
 	cpath->custom_paths = list_make1(quals_pathnode);
-	cpath->custom_private = list_make1(pathnode);
+	cpath->custom_private = list_make1(anns_pathnode);
 	cpath->methods = &hybridquery_path_methods;
 
 	add_path(baserel, &cpath->path);  // 其实就是传递的CustomPath的指针，只是为了达到类似C++的多态效果
@@ -1461,22 +1463,22 @@ PlanHybridQueryPath(PlannerInfo *root,
 	CustomScan	   *cscan = makeNode(CustomScan);
 
 	IndexPath *quals_ipath = (IndexPath *) lfirst(list_head(best_path->custom_paths));
-	IndexPath *ipath = (IndexPath *) lfirst(list_head(best_path->custom_private));
+	IndexPath *anns_ipath = (IndexPath *) lfirst(list_head(best_path->custom_private));
 
 	IndexScan *quals_indexscan;
 	quals_indexscan = (IndexScan *)hybridquery_create_indexscan_plan(root, quals_ipath, tlist, clauses, false);
 
 	// 1. 以createplan.c中create_indexscan_plan函数的方式，调用make_indexscan创建Scan对象（实际上是Plan的子类），
 	// make_indexscan函数需要的参数存放在CustomPath中，而CustomPath会在create_hybridquery_path被填充。
-	IndexScan	   *indexscan;
-	indexscan = (IndexScan *)hybridquery_create_indexscan_plan(root, ipath, tlist, clauses, false);
+	IndexScan	   *anns_indexscan;
+	anns_indexscan = (IndexScan *)hybridquery_create_indexscan_plan(root, anns_ipath, tlist, clauses, false);
 
 	// 2. 填充CustomScan
-	cscan->scan = indexscan->scan;
-	cscan->scan.plan.type = T_CustomScan;
+	cscan->scan = anns_indexscan->scan;  // TODO: 基类的成员该使用什么值进行初始化？暂时使用的向量索引对应的IndexScan的基类进行初始化的
+	NodeSetTag(cscan, T_CustomScan);
 	cscan->flags = best_path->flags;
 	cscan->custom_plans = list_make1(quals_indexscan);  // 保存结构化索引的IndexScan到CustomScan
-	cscan->custom_private = list_make1(indexscan);  // 保存IndexScan到CustomScan
+	cscan->custom_private = list_make1(anns_indexscan);  // 保存IndexScan到CustomScan
 	cscan->methods = &hybridquery_scan_methods;
 
 	return &cscan->scan.plan;  // 其实就是返回CustomScan的指针，只是为了达到类似C++的多态效果
@@ -1495,7 +1497,7 @@ CreateHybridQueryScanState(CustomScan *custom_plan)
 	hqs->css.methods = &hybridquery_exec_methods;
 
 	hqs->quals_is = (IndexScan *) lfirst(list_head(custom_plan->custom_plans));
-	hqs->is = (IndexScan *) lfirst(list_head(custom_plan->custom_private));
+	hqs->anns_is = (IndexScan *) lfirst(list_head(custom_plan->custom_private));
 
 	return (Node *)&hqs->css;
 }
@@ -1560,11 +1562,13 @@ static void
 BeginHybridQueryScan(CustomScanState *css, EState *estate, int eflags)
 {
 	HybridQueryState  *hqs = (HybridQueryState *)css;
+
+	hqs->quals_iss = (IndexScanState *) ExecInitNode(&(hqs->quals_is->scan.plan), estate, eflags);
 	
 	// 完成所提供的CustomScanState的初始化。标准的域已经被ExecInitCustomScan初始化，但是任何私有的域应该在这里被初始化。
 	// 完成HybridQueryState中除CustomScanState的其他成员的初始化
-	HybridQueryIndexScanState *indexstate = (HybridQueryIndexScanState *)((char *)hqs + offsetof(HybridQueryState, is));
-	IndexScan *node = hqs->is;  // IndexScan
+	HybridQueryIndexScanState *indexstate = (HybridQueryIndexScanState *)((char *)hqs + offsetof(HybridQueryState, anns_iss));
+	IndexScan *node = hqs->anns_is;  // IndexScan
 
 	Relation	currentRelation;
 	bool		relistarget;
@@ -1696,7 +1700,7 @@ static TupleTableSlot *
 HybridQueryAccess(CustomScanState *css)
 {
 	HybridQueryState  *hqs = (HybridQueryState *)css;
-	HybridQueryIndexScanState *node = (HybridQueryIndexScanState *)((char *)hqs + offsetof(HybridQueryState, is));
+	HybridQueryIndexScanState *node = (HybridQueryIndexScanState *)((char *)hqs + offsetof(HybridQueryState, anns_iss));
 
 	EState	   *estate;
 	ExprContext *econtext;
@@ -1704,6 +1708,27 @@ HybridQueryAccess(CustomScanState *css)
 	IndexScanDesc scandesc;
 	HeapTuple	tuple;
 	TupleTableSlot *slot;
+
+	static bool quals_scan_finish = false;
+	TupleTableSlot *quals_slot;
+	int quals_cnt = 0;
+
+	// 获取结构化条件的结果
+	if (!quals_scan_finish)
+	{
+		for (;;)
+		{
+			quals_slot = ExecProcNode(&(hqs->quals_iss->ss.ps));
+			if (TupIsNull(quals_slot))
+			{
+				break;
+				quals_scan_finish = true;
+			}
+			else
+				quals_cnt++;
+		}
+		elog(WARNING, "quals_cnt: %d", quals_cnt);
+	}
 
 	/*
 	 * extract necessary information from index scan node
@@ -1840,8 +1865,10 @@ EndHybridQueryScan(CustomScanState *node)
 	 */
 	if (indexScanDesc)
 		index_endscan(indexScanDesc);
-	if (indexRelationDesc)
-		index_close(indexRelationDesc, NoLock);
+	// if (indexRelationDesc)
+	// 	index_close(indexRelationDesc, NoLock);
+
+	ExecEndNode(&(hqs->quals_iss->ss.ps));
 }
 
 /*
@@ -1915,6 +1942,6 @@ void _PG_fini(void)
 	set_rel_pathlist_hook = NULL;
 }
 
-// #ifdef __cplusplus
-// }
-// #endif
+#ifdef __cplusplus
+}
+#endif
