@@ -1,3 +1,5 @@
+#include <vector>
+
 #ifdef __cplusplus
 extern "C"
 {
@@ -1693,6 +1695,16 @@ BeginHybridQueryScan(CustomScanState *css, EState *estate, int eflags)
 	return;
 }
 
+typedef struct PGIVFPQScanOpaqueData
+{
+	MemoryContext scan_ctx;
+	pairingheap *queue;
+	ItemPointerData *quals_ipds;
+	uint32 quals_ipds_cnt;
+	bool first_call;
+} PGIVFPQScanOpaqueData;
+typedef PGIVFPQScanOpaqueData * PGIVFPQScanOpaque;
+
 /*
  * HybridQueryAccess
  */
@@ -1709,26 +1721,13 @@ HybridQueryAccess(CustomScanState *css)
 	HeapTuple	tuple;
 	TupleTableSlot *slot;
 
-	static bool quals_scan_finish = false;
 	TupleTableSlot *quals_slot;
 	int quals_cnt = 0;
 
-	// 获取结构化条件的结果
-	if (!quals_scan_finish)
-	{
-		for (;;)
-		{
-			quals_slot = ExecProcNode(&(hqs->quals_iss->ss.ps));
-			if (TupIsNull(quals_slot))
-			{
-				break;
-				quals_scan_finish = true;
-			}
-			else
-				quals_cnt++;
-		}
-		elog(WARNING, "quals_cnt: %d", quals_cnt);
-	}
+	// TODO:
+	hqs->quals_iss->ss.ps.ps_ProjInfo = NULL;
+
+	std::vector<ItemPointerData> ipd_vec;
 
 	/*
 	 * extract necessary information from index scan node
@@ -1770,6 +1769,38 @@ HybridQueryAccess(CustomScanState *css)
 			index_rescan(scandesc,
 						 node->iss_ScanKeys, node->iss_NumScanKeys,
 						 node->iss_OrderByKeys, node->iss_NumOrderByKeys);
+	}
+
+	// 获取结构化条件的结果
+	PGIVFPQScanOpaque so = (PGIVFPQScanOpaque)scandesc->opaque;
+	if (so->first_call)
+	{
+		for (;;)
+		{
+			quals_slot = ExecProcNode(&(hqs->quals_iss->ss.ps));
+			if (TupIsNull(quals_slot))
+			{
+				break;
+			}
+			else
+			{
+				ipd_vec.push_back(quals_slot->tts_tuple->t_self);
+				quals_cnt++;
+			}
+		}
+		elog(WARNING, "quals_cnt: %d", quals_cnt);
+
+		MemoryContext old_ctx;
+
+		old_ctx = MemoryContextSwitchTo(so->scan_ctx);
+		ItemPointerData *quals_ipds = (ItemPointerData *) palloc0(sizeof(ItemPointerData) * quals_cnt);
+		for (int i = 0; i < quals_cnt; i++)
+			quals_ipds[i] = ipd_vec[i];
+		
+		so->quals_ipds = quals_ipds;
+		so->quals_ipds_cnt = quals_cnt;
+
+		MemoryContextSwitchTo(old_ctx);
 	}
 
 	/*
