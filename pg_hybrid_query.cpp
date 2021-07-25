@@ -10,6 +10,7 @@ extern "C"
 #include "access/sysattr.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
+#include "catalog/pg_statistic.h"
 #include "commands/defrem.h"
 #include "commands/explain.h"
 #include "executor/executor.h"
@@ -44,6 +45,7 @@ extern "C"
 #include "utils/ruleutils.h"
 #include "utils/spccache.h"
 #include "utils/selfuncs.h"
+#include "utils/syscache.h"
 
 PG_MODULE_MAGIC;
 
@@ -159,6 +161,8 @@ tryfind_anns_index(PlannerInfo *root,
 
 		/* Protect limited-size array in IndexClauseSets */
 		Assert(index->ncolumns <= INDEX_MAX_KEYS);
+
+		// NOTE: baserel->baserestrictinfo中不包含order by语句，需要按照create_hybridquery_path中检查order by语句那样去进行检查
 
 		/* 16386: pg_ivfpq am oid */
 		if (index->relam != 16386)
@@ -281,13 +285,629 @@ simple_match_clause_to_index(IndexOptInfo *index,
 	}
 }
 
+static List *
+deconstruct_indexquals_for_hybridquery(IndexOptInfo *index, List *index_quals, List *quals_columns)
+{
+	List	   *result = NIL;
+	ListCell   *lcc,
+			   *lci;
+
+	forboth(lcc, index_quals, lci, quals_columns)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lcc);
+		int			indexcol = lfirst_int(lci);
+		Expr	   *clause;
+		Node	   *leftop,
+				   *rightop;
+		IndexQualInfo *qinfo;
+
+		clause = rinfo->clause;
+
+		qinfo = (IndexQualInfo *) palloc(sizeof(IndexQualInfo));
+		qinfo->rinfo = rinfo;
+		qinfo->indexcol = indexcol;
+
+		if (IsA(clause, OpExpr))
+		{
+			qinfo->clause_op = ((OpExpr *) clause)->opno;
+			leftop = get_leftop(clause);
+			rightop = get_rightop(clause);
+			if (match_index_to_operand(leftop, indexcol, index))
+			{
+				qinfo->varonleft = true;
+				qinfo->other_operand = rightop;
+			}
+			else
+			{
+				Assert(match_index_to_operand(rightop, indexcol, index));
+				qinfo->varonleft = false;
+				qinfo->other_operand = leftop;
+			}
+		}
+		else if (IsA(clause, RowCompareExpr))
+		{
+			RowCompareExpr *rc = (RowCompareExpr *) clause;
+
+			qinfo->clause_op = linitial_oid(rc->opnos);
+			/* Examine only first columns to determine left/right sides */
+			if (match_index_to_operand((Node *) linitial(rc->largs),
+									   indexcol, index))
+			{
+				qinfo->varonleft = true;
+				qinfo->other_operand = (Node *) rc->rargs;
+			}
+			else
+			{
+				Assert(match_index_to_operand((Node *) linitial(rc->rargs),
+											  indexcol, index));
+				qinfo->varonleft = false;
+				qinfo->other_operand = (Node *) rc->largs;
+			}
+		}
+		else if (IsA(clause, ScalarArrayOpExpr))
+		{
+			ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
+
+			qinfo->clause_op = saop->opno;
+			/* index column is always on the left in this case */
+			Assert(match_index_to_operand((Node *) linitial(saop->args),
+										  indexcol, index));
+			qinfo->varonleft = true;
+			qinfo->other_operand = (Node *) lsecond(saop->args);
+		}
+		else if (IsA(clause, NullTest))
+		{
+			qinfo->clause_op = InvalidOid;
+			Assert(match_index_to_operand((Node *) ((NullTest *) clause)->arg,
+										  indexcol, index));
+			qinfo->varonleft = true;
+			qinfo->other_operand = NULL;
+		}
+		else
+		{
+			elog(ERROR, "unsupported indexqual type: %d",
+				 (int) nodeTag(clause));
+		}
+
+		result = lappend(result, qinfo);
+	}
+	return result;
+}
+
+static void
+genericcostestimate_for_hybridquery(PlannerInfo *root,
+					IndexOptInfo *index,
+					List *indexQuals,
+					List *qinfos,
+					GenericCosts *costs)
+{
+	// IndexOptInfo *index = path->indexinfo;
+	// List	   *indexQuals = path->indexquals;
+	// List	   *indexOrderBys = path->indexorderbys;
+	Cost		indexStartupCost;
+	Cost		indexTotalCost;
+	Selectivity indexSelectivity;
+	double		indexCorrelation;
+	double		numIndexPages;
+	double		numIndexTuples;
+	double		spc_random_page_cost;
+	double		num_sa_scans;
+	double		num_outer_scans;
+	double		num_scans;
+	double		qual_op_cost;
+	double		qual_arg_cost;
+	List	   *selectivityQuals;
+	ListCell   *l;
+
+	/*
+	 * If the index is partial, AND the index predicate with the explicitly
+	 * given indexquals to produce a more accurate idea of the index
+	 * selectivity.
+	 */
+	selectivityQuals = add_predicate_to_quals(index, indexQuals);
+
+	/*
+	 * Check for ScalarArrayOpExpr index quals, and estimate the number of
+	 * index scans that will be performed.
+	 */
+	num_sa_scans = 1;
+	foreach(l, indexQuals)
+	{
+		RestrictInfo *rinfo = (RestrictInfo *) lfirst(l);
+
+		if (IsA(rinfo->clause, ScalarArrayOpExpr))
+		{
+			ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) rinfo->clause;
+			int			alength = estimate_array_length(lsecond(saop->args));
+
+			if (alength > 1)
+				num_sa_scans *= alength;
+		}
+	}
+
+	/* Estimate the fraction of main-table tuples that will be visited */
+	indexSelectivity = clauselist_selectivity(root, selectivityQuals,
+											  index->rel->relid,
+											  JOIN_INNER,
+											  NULL);
+
+	/*
+	 * If caller didn't give us an estimate, estimate the number of index
+	 * tuples that will be visited.  We do it in this rather peculiar-looking
+	 * way in order to get the right answer for partial indexes.
+	 */
+	numIndexTuples = costs->numIndexTuples;
+	if (numIndexTuples <= 0.0)
+	{
+		numIndexTuples = indexSelectivity * index->rel->tuples;
+
+		/*
+		 * The above calculation counts all the tuples visited across all
+		 * scans induced by ScalarArrayOpExpr nodes.  We want to consider the
+		 * average per-indexscan number, so adjust.  This is a handy place to
+		 * round to integer, too.  (If caller supplied tuple estimate, it's
+		 * responsible for handling these considerations.)
+		 */
+		numIndexTuples = rint(numIndexTuples / num_sa_scans);
+	}
+
+	/*
+	 * We can bound the number of tuples by the index size in any case. Also,
+	 * always estimate at least one tuple is touched, even when
+	 * indexSelectivity estimate is tiny.
+	 */
+	if (numIndexTuples > index->tuples)
+		numIndexTuples = index->tuples;
+	if (numIndexTuples < 1.0)
+		numIndexTuples = 1.0;
+
+	/*
+	 * Estimate the number of index pages that will be retrieved.
+	 *
+	 * We use the simplistic method of taking a pro-rata fraction of the total
+	 * number of index pages.  In effect, this counts only leaf pages and not
+	 * any overhead such as index metapage or upper tree levels.
+	 *
+	 * In practice access to upper index levels is often nearly free because
+	 * those tend to stay in cache under load; moreover, the cost involved is
+	 * highly dependent on index type.  We therefore ignore such costs here
+	 * and leave it to the caller to add a suitable charge if needed.
+	 */
+	if (index->pages > 1 && index->tuples > 1)
+		numIndexPages = ceil(numIndexTuples * index->pages / index->tuples);
+	else
+		numIndexPages = 1.0;
+
+	/* fetch estimated page cost for tablespace containing index */
+	get_tablespace_page_costs(index->reltablespace,
+							  &spc_random_page_cost,
+							  NULL);
+
+	/*
+	 * Now compute the disk access costs.
+	 *
+	 * The above calculations are all per-index-scan.  However, if we are in a
+	 * nestloop inner scan, we can expect the scan to be repeated (with
+	 * different search keys) for each row of the outer relation.  Likewise,
+	 * ScalarArrayOpExpr quals result in multiple index scans.  This creates
+	 * the potential for cache effects to reduce the number of disk page
+	 * fetches needed.  We want to estimate the average per-scan I/O cost in
+	 * the presence of caching.
+	 *
+	 * We use the Mackert-Lohman formula (see costsize.c for details) to
+	 * estimate the total number of page fetches that occur.  While this
+	 * wasn't what it was designed for, it seems a reasonable model anyway.
+	 * Note that we are counting pages not tuples anymore, so we take N = T =
+	 * index size, as if there were one "tuple" per page.
+	 */
+	// NOTE: loop_count恒等于1
+	// num_outer_scans = loop_count;
+	num_outer_scans = 1;
+	num_scans = num_sa_scans * num_outer_scans;
+
+	if (num_scans > 1)
+	{
+		double		pages_fetched;
+
+		/* total page fetches ignoring cache effects */
+		pages_fetched = numIndexPages * num_scans;
+
+		/* use Mackert and Lohman formula to adjust for cache effects */
+		pages_fetched = index_pages_fetched(pages_fetched,
+											index->pages,
+											(double) index->pages,
+											root);
+
+		/*
+		 * Now compute the total disk access cost, and then report a pro-rated
+		 * share for each outer scan.  (Don't pro-rate for ScalarArrayOpExpr,
+		 * since that's internal to the indexscan.)
+		 */
+		indexTotalCost = (pages_fetched * spc_random_page_cost)
+			/ num_outer_scans;
+	}
+	else
+	{
+		/*
+		 * For a single index scan, we just charge spc_random_page_cost per
+		 * page touched.
+		 */
+		indexTotalCost = numIndexPages * spc_random_page_cost;
+	}
+
+	/*
+	 * CPU cost: any complex expressions in the indexquals will need to be
+	 * evaluated once at the start of the scan to reduce them to runtime keys
+	 * to pass to the index AM (see nodeIndexscan.c).  We model the per-tuple
+	 * CPU costs as cpu_index_tuple_cost plus one cpu_operator_cost per
+	 * indexqual operator.  Because we have numIndexTuples as a per-scan
+	 * number, we have to multiply by num_sa_scans to get the correct result
+	 * for ScalarArrayOpExpr cases.  Similarly add in costs for any index
+	 * ORDER BY expressions.
+	 *
+	 * Note: this neglects the possible costs of rechecking lossy operators.
+	 * Detecting that that might be needed seems more expensive than it's
+	 * worth, though, considering all the other inaccuracies here ...
+	 */
+	// NOTE: 直接去掉order by的代价
+	// qual_arg_cost = other_operands_eval_cost(root, qinfos) +
+	// 	orderby_operands_eval_cost(root, path);
+	// qual_op_cost = cpu_operator_cost *
+	// 	(list_length(indexQuals) + list_length(indexOrderBys));
+	qual_arg_cost = other_operands_eval_cost(root, qinfos);
+	qual_op_cost = cpu_operator_cost * list_length(indexQuals);
+
+	indexStartupCost = qual_arg_cost;
+	indexTotalCost += qual_arg_cost;
+	indexTotalCost += numIndexTuples * num_sa_scans * (cpu_index_tuple_cost + qual_op_cost);
+
+	/*
+	 * Generic assumption about index correlation: there isn't any.
+	 */
+	indexCorrelation = 0.0;
+
+	/*
+	 * Return everything to caller.
+	 */
+	costs->indexStartupCost = indexStartupCost;
+	costs->indexTotalCost = indexTotalCost;
+	costs->indexSelectivity = indexSelectivity;
+	costs->indexCorrelation = indexCorrelation;
+	costs->numIndexPages = numIndexPages;
+	costs->numIndexTuples = numIndexTuples;
+	costs->spc_random_page_cost = spc_random_page_cost;
+	costs->num_sa_scans = num_sa_scans;
+}
+
+/*
+ * estimate_index_selectivity
+ */
+static Selectivity
+estimate_index_selectivity(PlannerInfo *root,
+                                RelOptInfo *baserel,
+								IndexOptInfo *index,
+								IndexClauseSet *clauseset,
+								List **p_indexQuals)
+{
+	List	   *qinfos;
+	GenericCosts costs;
+	Oid			relid;
+	AttrNumber	colnum;
+	VariableStatData vardata;
+	double		numIndexTuples;
+	Cost		descentCost;
+	List	   *indexBoundQuals;
+	int			indexcol;
+	bool		eqQualHere;
+	bool		found_saop;
+	bool		found_is_null_op;
+	double		num_sa_scans;
+	ListCell   *lc;
+
+	List	   *index_clauses = NIL;
+	List	   *clause_columns = NIL;
+
+	List		*index_quals = NIL;
+	List		*quals_columns = NIL;
+
+	for (int indexcol = 0; indexcol < index->ncolumns; indexcol++)
+	{
+		ListCell   *lc;
+
+		foreach(lc, clauseset->indexclauses[indexcol])
+		{
+			RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+
+			index_clauses = lappend(index_clauses, rinfo);
+			clause_columns = lappend_int(clause_columns, indexcol);
+		}
+	}
+
+	expand_indexqual_conditions(index, index_clauses, clause_columns,
+								&index_quals, &quals_columns);
+
+	/* Do preliminary analysis of indexquals */
+	qinfos = deconstruct_indexquals_for_hybridquery(index, index_quals, quals_columns);
+
+	/*
+	 * For a btree scan, only leading '=' quals plus inequality quals for the
+	 * immediately next attribute contribute to index selectivity (these are
+	 * the "boundary quals" that determine the starting and stopping points of
+	 * the index scan).  Additional quals can suppress visits to the heap, so
+	 * it's OK to count them in indexSelectivity, but they should not count
+	 * for estimating numIndexTuples.  So we must examine the given indexquals
+	 * to find out which ones count as boundary quals.  We rely on the
+	 * knowledge that they are given in index column order.
+	 *
+	 * For a RowCompareExpr, we consider only the first column, just as
+	 * rowcomparesel() does.
+	 *
+	 * If there's a ScalarArrayOpExpr in the quals, we'll actually perform N
+	 * index scans not one, but the ScalarArrayOpExpr's operator can be
+	 * considered to act the same as it normally does.
+	 */
+	indexBoundQuals = NIL;
+	indexcol = 0;
+	eqQualHere = false;
+	found_saop = false;
+	found_is_null_op = false;
+	num_sa_scans = 1;
+	foreach(lc, qinfos)
+	{
+		IndexQualInfo *qinfo = (IndexQualInfo *) lfirst(lc);
+		RestrictInfo *rinfo = qinfo->rinfo;
+		Expr	   *clause = rinfo->clause;
+		Oid			clause_op;
+		int			op_strategy;
+
+		if (indexcol != qinfo->indexcol)
+		{
+			/* Beginning of a new column's quals */
+			if (!eqQualHere)
+				break;			/* done if no '=' qual for indexcol */
+			eqQualHere = false;
+			indexcol++;
+			if (indexcol != qinfo->indexcol)
+				break;			/* no quals at all for indexcol */
+		}
+
+		if (IsA(clause, ScalarArrayOpExpr))
+		{
+			int			alength = estimate_array_length(qinfo->other_operand);
+
+			found_saop = true;
+			/* count up number of SA scans induced by indexBoundQuals only */
+			if (alength > 1)
+				num_sa_scans *= alength;
+		}
+		else if (IsA(clause, NullTest))
+		{
+			NullTest   *nt = (NullTest *) clause;
+
+			if (nt->nulltesttype == IS_NULL)
+			{
+				found_is_null_op = true;
+				/* IS NULL is like = for selectivity determination purposes */
+				eqQualHere = true;
+			}
+		}
+
+		/*
+		 * We would need to commute the clause_op if not varonleft, except
+		 * that we only care if it's equality or not, so that refinement is
+		 * unnecessary.
+		 */
+		clause_op = qinfo->clause_op;
+
+		/* check for equality operator */
+		if (OidIsValid(clause_op))
+		{
+			op_strategy = get_op_opfamily_strategy(clause_op,
+												   index->opfamily[indexcol]);
+			Assert(op_strategy != 0);	/* not a member of opfamily?? */
+			if (op_strategy == BTEqualStrategyNumber)
+				eqQualHere = true;
+		}
+
+		indexBoundQuals = lappend(indexBoundQuals, rinfo);
+	}
+
+	/*
+	 * If index is unique and we found an '=' clause for each column, we can
+	 * just assume numIndexTuples = 1 and skip the expensive
+	 * clauselist_selectivity calculations.  However, a ScalarArrayOp or
+	 * NullTest invalidates that theory, even though it sets eqQualHere.
+	 */
+	if (index->unique &&
+		indexcol == index->nkeycolumns - 1 &&
+		eqQualHere &&
+		!found_saop &&
+		!found_is_null_op)
+		numIndexTuples = 1.0;
+	else
+	{
+		List	   *selectivityQuals;
+		Selectivity btreeSelectivity;
+
+		/*
+		 * If the index is partial, AND the index predicate with the
+		 * index-bound quals to produce a more accurate idea of the number of
+		 * rows covered by the bound conditions.
+		 */
+		selectivityQuals = add_predicate_to_quals(index, indexBoundQuals);
+
+		btreeSelectivity = clauselist_selectivity(root, selectivityQuals,
+												  index->rel->relid,
+												  JOIN_INNER,
+												  NULL);
+		numIndexTuples = btreeSelectivity * index->rel->tuples;
+
+		/*
+		 * As in genericcostestimate(), we have to adjust for any
+		 * ScalarArrayOpExpr quals included in indexBoundQuals, and then round
+		 * to integer.
+		 */
+		numIndexTuples = rint(numIndexTuples / num_sa_scans);
+	}
+
+	/*
+	 * Now do generic index cost estimation.
+	 */
+	MemSet(&costs, 0, sizeof(costs));
+	costs.numIndexTuples = numIndexTuples;
+
+	genericcostestimate_for_hybridquery(root, index, index_quals, qinfos, &costs);
+
+	/*
+	 * Add a CPU-cost component to represent the costs of initial btree
+	 * descent.  We don't charge any I/O cost for touching upper btree levels,
+	 * since they tend to stay in cache, but we still have to do about log2(N)
+	 * comparisons to descend a btree of N leaf tuples.  We charge one
+	 * cpu_operator_cost per comparison.
+	 *
+	 * If there are ScalarArrayOpExprs, charge this once per SA scan.  The
+	 * ones after the first one are not startup cost so far as the overall
+	 * plan is concerned, so add them only to "total" cost.
+	 */
+	if (index->tuples > 1)		/* avoid computing log(0) */
+	{
+		descentCost = ceil(log(index->tuples) / log(2.0)) * cpu_operator_cost;
+		costs.indexStartupCost += descentCost;
+		costs.indexTotalCost += costs.num_sa_scans * descentCost;
+	}
+
+	/*
+	 * Even though we're not charging I/O cost for touching upper btree pages,
+	 * it's still reasonable to charge some CPU cost per page descended
+	 * through.  Moreover, if we had no such charge at all, bloated indexes
+	 * would appear to have the same search cost as unbloated ones, at least
+	 * in cases where only a single leaf page is expected to be visited.  This
+	 * cost is somewhat arbitrarily set at 50x cpu_operator_cost per page
+	 * touched.  The number of such pages is btree tree height plus one (ie,
+	 * we charge for the leaf page too).  As above, charge once per SA scan.
+	 */
+	descentCost = (index->tree_height + 1) * 50.0 * cpu_operator_cost;
+	costs.indexStartupCost += descentCost;
+	costs.indexTotalCost += costs.num_sa_scans * descentCost;
+
+	/*
+	 * If we can get an estimate of the first column's ordering correlation C
+	 * from pg_statistic, estimate the index correlation as C for a
+	 * single-column index, or C * 0.75 for multiple columns. (The idea here
+	 * is that multiple columns dilute the importance of the first column's
+	 * ordering, but don't negate it entirely.  Before 8.0 we divided the
+	 * correlation by the number of columns, but that seems too strong.)
+	 */
+	MemSet(&vardata, 0, sizeof(vardata));
+
+	if (index->indexkeys[0] != 0)
+	{
+		/* Simple variable --- look to stats for the underlying table */
+		RangeTblEntry *rte = planner_rt_fetch(index->rel->relid, root);
+
+		Assert(rte->rtekind == RTE_RELATION);
+		relid = rte->relid;
+		Assert(relid != InvalidOid);
+		colnum = index->indexkeys[0];
+
+		if (get_relation_stats_hook &&
+			(*get_relation_stats_hook) (root, rte, colnum, &vardata))
+		{
+			/*
+			 * The hook took control of acquiring a stats tuple.  If it did
+			 * supply a tuple, it'd better have supplied a freefunc.
+			 */
+			if (HeapTupleIsValid(vardata.statsTuple) &&
+				!vardata.freefunc)
+				elog(ERROR, "no function provided to release variable stats with");
+		}
+		else
+		{
+			vardata.statsTuple = SearchSysCache3(STATRELATTINH,
+												 ObjectIdGetDatum(relid),
+												 Int16GetDatum(colnum),
+												 BoolGetDatum(rte->inh));
+			vardata.freefunc = ReleaseSysCache;
+		}
+	}
+	else
+	{
+		/* Expression --- maybe there are stats for the index itself */
+		relid = index->indexoid;
+		colnum = 1;
+
+		if (get_index_stats_hook &&
+			(*get_index_stats_hook) (root, relid, colnum, &vardata))
+		{
+			/*
+			 * The hook took control of acquiring a stats tuple.  If it did
+			 * supply a tuple, it'd better have supplied a freefunc.
+			 */
+			if (HeapTupleIsValid(vardata.statsTuple) &&
+				!vardata.freefunc)
+				elog(ERROR, "no function provided to release variable stats with");
+		}
+		else
+		{
+			vardata.statsTuple = SearchSysCache3(STATRELATTINH,
+												 ObjectIdGetDatum(relid),
+												 Int16GetDatum(colnum),
+												 BoolGetDatum(false));
+			vardata.freefunc = ReleaseSysCache;
+		}
+	}
+
+	if (HeapTupleIsValid(vardata.statsTuple))
+	{
+		Oid			sortop;
+		AttStatsSlot sslot;
+
+		sortop = get_opfamily_member(index->opfamily[0],
+									 index->opcintype[0],
+									 index->opcintype[0],
+									 BTLessStrategyNumber);
+		if (OidIsValid(sortop) &&
+			get_attstatsslot(&sslot, vardata.statsTuple,
+							 STATISTIC_KIND_CORRELATION, sortop,
+							 ATTSTATSSLOT_NUMBERS))
+		{
+			double		varCorrelation;
+
+			Assert(sslot.nnumbers == 1);
+			varCorrelation = sslot.numbers[0];
+
+			if (index->reverse_sort[0])
+				varCorrelation = -varCorrelation;
+
+			if (index->ncolumns > 1)
+				costs.indexCorrelation = varCorrelation * 0.75;
+			else
+				costs.indexCorrelation = varCorrelation;
+
+			free_attstatsslot(&sslot);
+		}
+	}
+
+	ReleaseVariableStats(vardata);
+
+	if (p_indexQuals)
+		*p_indexQuals = index_quals;
+
+	return costs.indexSelectivity;
+}
+
 static IndexOptInfo *
 tryfind_structured_index(PlannerInfo *root,
 						  RelOptInfo *baserel,
-						  IndexClauseSet *clauseset)
+						  List **p_index_conds,
+						  List **p_indexQuals,
+						  Selectivity *p_selectivity)
 {
-	IndexOptInfo   *indexOpt = NULL;
-	ListCell	   *cell;
+	IndexOptInfo	*indexOpt = NULL;
+	List			*indexQuals = NIL;
+	ListCell		*cell;
+	Selectivity		selectivity = 1.0;
+
 
 	/* skip if no indexes */
 	if (baserel->indexlist == NIL)
@@ -297,24 +917,51 @@ tryfind_structured_index(PlannerInfo *root,
 	{
 		IndexOptInfo   *index = (IndexOptInfo *) lfirst(cell);
 		ListCell	   *lc;
-		IndexClauseSet rclauseset;
+		IndexClauseSet	clauseset;
+		List		   *temp_index_quals = NIL;
+		List		   *temp_quals_columns = NIL;
+		Selectivity		s;
 
 		/* Protect limited-size array in IndexClauseSets */
 		Assert(index->ncolumns <= INDEX_MAX_KEYS);
 
-		MemSet(&rclauseset, 0, sizeof(rclauseset));
+		MemSet(&clauseset, 0, sizeof(clauseset));
+		// NOTE: 每个IndexOptInfo里面的indrestrictinfo成员和RelOptInfo的baserestrictinfo成员都指向同一个值，表示RelOptInfo上非连接的约束条件
 		foreach (lc, index->indrestrictinfo)
 		{
 			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
 
-			simple_match_clause_to_index(index, rinfo, &rclauseset);
+			simple_match_clause_to_index(index, rinfo, &clauseset);
 		}
-		if (!rclauseset.nonempty)
+		if (!clauseset.nonempty)
 			continue;
 
+		/*
+		 * 当有多个索引被匹配到时，选择率最低的索引为最优的索引
+		 * NOTE: 这里只估计单列属性的选择率，因为单列属性的选择率估计得比较准，多列属性的选择率目前估计得不是很准
+		 */
+ 		s = estimate_index_selectivity(root, baserel, index,
+									   &clauseset, &temp_index_quals);
 
-		indexOpt = index;
-		*clauseset = rclauseset;
+		// 只关注选择率，因为要通过结构化索引的结果去优化向量索引的搜索，结构化索引的选择率越低，向量索引的搜索越快！
+		if (selectivity > s)
+		{
+			indexOpt = index;
+			indexQuals = temp_index_quals;
+			selectivity = s;
+		}
+	}
+
+	if (indexOpt)
+	{
+		// 索引条件
+		if (p_indexConds)
+			*p_indexConds = indexQuals;  // TODO: indexConds和indexQuals已经傻傻分不清了，，，
+		// 索引（结果）约束
+		if (p_indexQuals)
+			*p_indexQuals = indexQuals;
+		if (p_selectivity)
+			*p_selectivity = selectivity;
 	}
 
 	return indexOpt;
@@ -658,6 +1305,7 @@ create_hybridquery_path(PlannerInfo *root,
 
 	IndexPath *ipath;
 
+	// TODO: 不支持LA
 	outer_relids = bms_copy(rel->lateral_relids);
 	outer_relids = bms_del_member(outer_relids, rel->relid);
 	if (bms_is_empty(outer_relids))
@@ -761,7 +1409,9 @@ set_hybridquery_path(PlannerInfo *root, RelOptInfo *baserel,
 
 	IndexOptInfo	*quals_indexOpt;
 	IndexPath		*quals_pathnode;
-	IndexClauseSet 	clauseset;
+	List			*indexConds;
+	List			*indexQuals;
+	Selectivity		selectivity;
 
 	CustomPath		*cpath;
 
@@ -774,14 +1424,32 @@ set_hybridquery_path(PlannerInfo *root, RelOptInfo *baserel,
 
 	if (!enable_hybridquery)
 		return;
+
+	// TODO: 是否能进行联合查询，不能，则直接返回，即使用PG规划的路径（ANNS+Filter）
+	// 能进行联合查询的条件：1. 有ANNS查询；2. 带约束条件；3. 约束条件+ANNS查询的代价比ANNS+Filter的代价低。
+	// 步骤：1. 找到约束条件中的索引和对应的约束条件；2. 从这些索引中选择选择率最低的索引；3. 构建对应的索引。
 	
 	// 1. 结构化索引
-	quals_indexOpt = tryfind_structured_index(root, baserel, &clauseset);
+	// TODO: 变量名、函数名更改
+	List *structuered_indexes;
+	List *structuered_clauses;
+	IndexOptInfo *best_structured_index;
+	List		 *best_structured_clauses;
+	structuered_indexes = tryfind_structured_index(root, baserel, &structuered_clauses);
 	quals_pathnode = create_structured_path(root, baserel, quals_indexOpt, &clauseset);
+
+	if (quals_indexOpt == NULL)
+		return;
 	
 	// 2. 向量索引
+	// TODO: 变量名、函数名更改
 	anns_indexOpt = tryfind_anns_index(root, baserel);
 	anns_pathnode = create_hybridquery_path(root, baserel, anns_indexOpt);
+
+	if (anns_indexOpt == NULL)
+		return;
+
+	// TODO: 计算约束条件+ANNS查询的代价；计算ANNS+Filter的代价；如果前者比后者高，直接返回，否则，进行联合查询
 
 	// 3. 填充CustomPath数据结构，并把上一步得到IndexPath数据结构保存到custom_private成员中
 	cpath = makeNode(CustomPath);
@@ -1772,6 +2440,7 @@ HybridQueryAccess(CustomScanState *css)
 	}
 
 	// 获取结构化条件的结果
+	// TODO: 把结构化条件的结果存放在opaque中，但是需要抽象出来作为基类，这样就不依赖某种特定的向量索引了，但所有向量索引的opaque都需要继承这个基类
 	PGIVFPQScanOpaque so = (PGIVFPQScanOpaque)scandesc->opaque;
 	if (so->first_call)
 	{
@@ -1962,6 +2631,10 @@ _PG_init(void)
 							 PGC_USERSET,
 							 GUC_NOT_IN_SAMPLE,
 							 NULL, NULL, NULL);
+	
+	// TODO: 添加GUC参数：计算distance table和一条pq code之间的距离的cost
+
+	// TODO: 添加GUC参数：计算索引中任意一条pq code与一个原始向量之间的距离的cost
 
 	/* registration of the hook to add alternative path */
 	set_rel_pathlist_next = set_rel_pathlist_hook;
