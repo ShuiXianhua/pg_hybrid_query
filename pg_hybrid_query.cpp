@@ -11,6 +11,7 @@ extern "C"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_statistic.h"
+#include "catalog/pg_am.h"
 #include "commands/defrem.h"
 #include "commands/explain.h"
 #include "executor/executor.h"
@@ -84,6 +85,8 @@ typedef struct {
 /* static variables */
 static bool		enable_hybridquery;
 static set_rel_pathlist_hook_type set_rel_pathlist_next = NULL;
+double cost_from_distance_tables;
+double cost_from_two_codes;
 
 /* function declarations */
 void _PG_init(void);
@@ -579,408 +582,149 @@ genericcostestimate_for_hybridquery(PlannerInfo *root,
 	costs->num_sa_scans = num_sa_scans;
 }
 
-/*
- * estimate_index_selectivity
- */
-static Selectivity
-estimate_index_selectivity(PlannerInfo *root,
-                                RelOptInfo *baserel,
-								IndexOptInfo *index,
-								IndexClauseSet *clauseset,
-								List **p_indexQuals)
+static IndexPath *
+create_structured_index_path(PlannerInfo *root,
+							 RelOptInfo *baserel,
+							 IndexOptInfo *index,
+							 IndexClauseSet *clauseset)
 {
-	List	   *qinfos;
-	GenericCosts costs;
-	Oid			relid;
-	AttrNumber	colnum;
-	VariableStatData vardata;
-	double		numIndexTuples;
-	Cost		descentCost;
-	List	   *indexBoundQuals;
-	int			indexcol;
-	bool		eqQualHere;
-	bool		found_saop;
-	bool		found_is_null_op;
-	double		num_sa_scans;
-	ListCell   *lc;
+	List	  *result = NIL;
+	IndexPath *ipath;
+	List	  *index_clauses;
+	List	  *clause_columns;
+	Relids	   outer_relids;
+	double	   loop_count;
+	List	  *orderbyclauses;
+	List	  *orderbyclausecols;
+	List	  *index_pathkeys;
+	List	  *useful_pathkeys;
+	bool	   found_lower_saop_clause;
+	bool	   pathkeys_possibly_useful;
+	bool	   index_is_ordered;
+	bool	   index_only_scan;
+	int		   indexcol;
 
-	List	   *index_clauses = NIL;
-	List	   *clause_columns = NIL;
-
-	List		*index_quals = NIL;
-	List		*quals_columns = NIL;
-
-	for (int indexcol = 0; indexcol < index->ncolumns; indexcol++)
+	for (indexcol = 0; indexcol < index->ncolumns; indexcol++)
 	{
 		ListCell   *lc;
 
-		foreach(lc, clauseset->indexclauses[indexcol])
+		foreach (lc, clauses->indexclauses[indexcol])
 		{
 			RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
 
 			index_clauses = lappend(index_clauses, rinfo);
 			clause_columns = lappend_int(clause_columns, indexcol);
 		}
+
+		if (index_clauses == NIL && !index->amoptionalkey)
+			return NIL;
 	}
 
-	expand_indexqual_conditions(index, index_clauses, clause_columns,
-								&index_quals, &quals_columns);
-
-	/* Do preliminary analysis of indexquals */
-	qinfos = deconstruct_indexquals_for_hybridquery(index, index_quals, quals_columns);
+	/* 忽略结构化条件的ORDER BY表达式 */
+	useful_pathkeys = NIL;
+	orderbyclauses = NIL;
+	orderbyclausecols = NIL;
 
 	/*
-	 * For a btree scan, only leading '=' quals plus inequality quals for the
-	 * immediately next attribute contribute to index selectivity (these are
-	 * the "boundary quals" that determine the starting and stopping points of
-	 * the index scan).  Additional quals can suppress visits to the heap, so
-	 * it's OK to count them in indexSelectivity, but they should not count
-	 * for estimating numIndexTuples.  So we must examine the given indexquals
-	 * to find out which ones count as boundary quals.  We rely on the
-	 * knowledge that they are given in index column order.
-	 *
-	 * For a RowCompareExpr, we consider only the first column, just as
-	 * rowcomparesel() does.
-	 *
-	 * If there's a ScalarArrayOpExpr in the quals, we'll actually perform N
-	 * index scans not one, but the ScalarArrayOpExpr's operator can be
-	 * considered to act the same as it normally does.
+	 * NOTE:
+	 * 结构化条件只用来缩小向量索引的搜索范围，只需要得到行数据在原始表中的ItemPointerData，
+	 * 因此此处只需要创建T_IndexOnlyScan。
 	 */
-	indexBoundQuals = NIL;
-	indexcol = 0;
-	eqQualHere = false;
-	found_saop = false;
-	found_is_null_op = false;
-	num_sa_scans = 1;
-	foreach(lc, qinfos)
-	{
-		IndexQualInfo *qinfo = (IndexQualInfo *) lfirst(lc);
-		RestrictInfo *rinfo = qinfo->rinfo;
-		Expr	   *clause = rinfo->clause;
-		Oid			clause_op;
-		int			op_strategy;
+	ipath = create_index_path(root, index,
+							index_clauses,
+							clause_columns,
+							NIL,
+							NIL,
+							useful_pathkeys,
+							ForwardScanDirection,	// ForwardScanDirection
+							true,					// T_IndexOnlyScan
+							NULL,
+							1.0,
+							false);
+	
+	/* 
+	 * TODO: 
+	 * 默认ForwardScanDirection，但不确定ForwardScanDirection和BackwardScanDirection的代价是否一样，
+	 * 如果不一样，还需要考虑BackwardScanDirection的路径，然后选择代价比较低的路径（选择率必定是一样的）。
+	 */	
 
-		if (indexcol != qinfo->indexcol)
-		{
-			/* Beginning of a new column's quals */
-			if (!eqQualHere)
-				break;			/* done if no '=' qual for indexcol */
-			eqQualHere = false;
-			indexcol++;
-			if (indexcol != qinfo->indexcol)
-				break;			/* no quals at all for indexcol */
-		}
-
-		if (IsA(clause, ScalarArrayOpExpr))
-		{
-			int			alength = estimate_array_length(qinfo->other_operand);
-
-			found_saop = true;
-			/* count up number of SA scans induced by indexBoundQuals only */
-			if (alength > 1)
-				num_sa_scans *= alength;
-		}
-		else if (IsA(clause, NullTest))
-		{
-			NullTest   *nt = (NullTest *) clause;
-
-			if (nt->nulltesttype == IS_NULL)
-			{
-				found_is_null_op = true;
-				/* IS NULL is like = for selectivity determination purposes */
-				eqQualHere = true;
-			}
-		}
-
-		/*
-		 * We would need to commute the clause_op if not varonleft, except
-		 * that we only care if it's equality or not, so that refinement is
-		 * unnecessary.
-		 */
-		clause_op = qinfo->clause_op;
-
-		/* check for equality operator */
-		if (OidIsValid(clause_op))
-		{
-			op_strategy = get_op_opfamily_strategy(clause_op,
-												   index->opfamily[indexcol]);
-			Assert(op_strategy != 0);	/* not a member of opfamily?? */
-			if (op_strategy == BTEqualStrategyNumber)
-				eqQualHere = true;
-		}
-
-		indexBoundQuals = lappend(indexBoundQuals, rinfo);
-	}
-
-	/*
-	 * If index is unique and we found an '=' clause for each column, we can
-	 * just assume numIndexTuples = 1 and skip the expensive
-	 * clauselist_selectivity calculations.  However, a ScalarArrayOp or
-	 * NullTest invalidates that theory, even though it sets eqQualHere.
-	 */
-	if (index->unique &&
-		indexcol == index->nkeycolumns - 1 &&
-		eqQualHere &&
-		!found_saop &&
-		!found_is_null_op)
-		numIndexTuples = 1.0;
-	else
-	{
-		List	   *selectivityQuals;
-		Selectivity btreeSelectivity;
-
-		/*
-		 * If the index is partial, AND the index predicate with the
-		 * index-bound quals to produce a more accurate idea of the number of
-		 * rows covered by the bound conditions.
-		 */
-		selectivityQuals = add_predicate_to_quals(index, indexBoundQuals);
-
-		btreeSelectivity = clauselist_selectivity(root, selectivityQuals,
-												  index->rel->relid,
-												  JOIN_INNER,
-												  NULL);
-		numIndexTuples = btreeSelectivity * index->rel->tuples;
-
-		/*
-		 * As in genericcostestimate(), we have to adjust for any
-		 * ScalarArrayOpExpr quals included in indexBoundQuals, and then round
-		 * to integer.
-		 */
-		numIndexTuples = rint(numIndexTuples / num_sa_scans);
-	}
-
-	/*
-	 * Now do generic index cost estimation.
-	 */
-	MemSet(&costs, 0, sizeof(costs));
-	costs.numIndexTuples = numIndexTuples;
-
-	genericcostestimate_for_hybridquery(root, index, index_quals, qinfos, &costs);
-
-	/*
-	 * Add a CPU-cost component to represent the costs of initial btree
-	 * descent.  We don't charge any I/O cost for touching upper btree levels,
-	 * since they tend to stay in cache, but we still have to do about log2(N)
-	 * comparisons to descend a btree of N leaf tuples.  We charge one
-	 * cpu_operator_cost per comparison.
-	 *
-	 * If there are ScalarArrayOpExprs, charge this once per SA scan.  The
-	 * ones after the first one are not startup cost so far as the overall
-	 * plan is concerned, so add them only to "total" cost.
-	 */
-	if (index->tuples > 1)		/* avoid computing log(0) */
-	{
-		descentCost = ceil(log(index->tuples) / log(2.0)) * cpu_operator_cost;
-		costs.indexStartupCost += descentCost;
-		costs.indexTotalCost += costs.num_sa_scans * descentCost;
-	}
-
-	/*
-	 * Even though we're not charging I/O cost for touching upper btree pages,
-	 * it's still reasonable to charge some CPU cost per page descended
-	 * through.  Moreover, if we had no such charge at all, bloated indexes
-	 * would appear to have the same search cost as unbloated ones, at least
-	 * in cases where only a single leaf page is expected to be visited.  This
-	 * cost is somewhat arbitrarily set at 50x cpu_operator_cost per page
-	 * touched.  The number of such pages is btree tree height plus one (ie,
-	 * we charge for the leaf page too).  As above, charge once per SA scan.
-	 */
-	descentCost = (index->tree_height + 1) * 50.0 * cpu_operator_cost;
-	costs.indexStartupCost += descentCost;
-	costs.indexTotalCost += costs.num_sa_scans * descentCost;
-
-	/*
-	 * If we can get an estimate of the first column's ordering correlation C
-	 * from pg_statistic, estimate the index correlation as C for a
-	 * single-column index, or C * 0.75 for multiple columns. (The idea here
-	 * is that multiple columns dilute the importance of the first column's
-	 * ordering, but don't negate it entirely.  Before 8.0 we divided the
-	 * correlation by the number of columns, but that seems too strong.)
-	 */
-	MemSet(&vardata, 0, sizeof(vardata));
-
-	if (index->indexkeys[0] != 0)
-	{
-		/* Simple variable --- look to stats for the underlying table */
-		RangeTblEntry *rte = planner_rt_fetch(index->rel->relid, root);
-
-		Assert(rte->rtekind == RTE_RELATION);
-		relid = rte->relid;
-		Assert(relid != InvalidOid);
-		colnum = index->indexkeys[0];
-
-		if (get_relation_stats_hook &&
-			(*get_relation_stats_hook) (root, rte, colnum, &vardata))
-		{
-			/*
-			 * The hook took control of acquiring a stats tuple.  If it did
-			 * supply a tuple, it'd better have supplied a freefunc.
-			 */
-			if (HeapTupleIsValid(vardata.statsTuple) &&
-				!vardata.freefunc)
-				elog(ERROR, "no function provided to release variable stats with");
-		}
-		else
-		{
-			vardata.statsTuple = SearchSysCache3(STATRELATTINH,
-												 ObjectIdGetDatum(relid),
-												 Int16GetDatum(colnum),
-												 BoolGetDatum(rte->inh));
-			vardata.freefunc = ReleaseSysCache;
-		}
-	}
-	else
-	{
-		/* Expression --- maybe there are stats for the index itself */
-		relid = index->indexoid;
-		colnum = 1;
-
-		if (get_index_stats_hook &&
-			(*get_index_stats_hook) (root, relid, colnum, &vardata))
-		{
-			/*
-			 * The hook took control of acquiring a stats tuple.  If it did
-			 * supply a tuple, it'd better have supplied a freefunc.
-			 */
-			if (HeapTupleIsValid(vardata.statsTuple) &&
-				!vardata.freefunc)
-				elog(ERROR, "no function provided to release variable stats with");
-		}
-		else
-		{
-			vardata.statsTuple = SearchSysCache3(STATRELATTINH,
-												 ObjectIdGetDatum(relid),
-												 Int16GetDatum(colnum),
-												 BoolGetDatum(false));
-			vardata.freefunc = ReleaseSysCache;
-		}
-	}
-
-	if (HeapTupleIsValid(vardata.statsTuple))
-	{
-		Oid			sortop;
-		AttStatsSlot sslot;
-
-		sortop = get_opfamily_member(index->opfamily[0],
-									 index->opcintype[0],
-									 index->opcintype[0],
-									 BTLessStrategyNumber);
-		if (OidIsValid(sortop) &&
-			get_attstatsslot(&sslot, vardata.statsTuple,
-							 STATISTIC_KIND_CORRELATION, sortop,
-							 ATTSTATSSLOT_NUMBERS))
-		{
-			double		varCorrelation;
-
-			Assert(sslot.nnumbers == 1);
-			varCorrelation = sslot.numbers[0];
-
-			if (index->reverse_sort[0])
-				varCorrelation = -varCorrelation;
-
-			if (index->ncolumns > 1)
-				costs.indexCorrelation = varCorrelation * 0.75;
-			else
-				costs.indexCorrelation = varCorrelation;
-
-			free_attstatsslot(&sslot);
-		}
-	}
-
-	ReleaseVariableStats(vardata);
-
-	if (p_indexQuals)
-		*p_indexQuals = index_quals;
-
-	return costs.indexSelectivity;
+	return ipath;
 }
 
-static IndexOptInfo *
-tryfind_structured_index(PlannerInfo *root,
-						  RelOptInfo *baserel,
-						  List **p_index_conds,
-						  List **p_indexQuals,
-						  Selectivity *p_selectivity)
+static List *
+find_structured_index_paths(PlannerInfo *root,
+							RelOptInfo *baserel)
 {
-	IndexOptInfo	*indexOpt = NULL;
-	List			*indexQuals = NIL;
-	ListCell		*cell;
-	Selectivity		selectivity = 1.0;
-
+	List		*index_paths = NIL;
+	ListCell	*icell;
 
 	/* skip if no indexes */
 	if (baserel->indexlist == NIL)
 		return NULL;
 
-	foreach (cell, baserel->indexlist)
+	foreach (icell, baserel->indexlist)
 	{
-		IndexOptInfo   *index = (IndexOptInfo *) lfirst(cell);
-		ListCell	   *lc;
-		IndexClauseSet	clauseset;
-		List		   *temp_index_quals = NIL;
-		List		   *temp_quals_columns = NIL;
-		Selectivity		s;
+		IndexOptInfo	*index = (IndexOptInfo *) lfirst(icell);
+		ListCell		*rcell;
+		IndexPath		*index_path;
+		IndexClauseSet	 clauseset;
+		int				 indrestrictcols = 0;
 
 		/* Protect limited-size array in IndexClauseSets */
 		Assert(index->ncolumns <= INDEX_MAX_KEYS);
 
+		/* Ignore partial indexes that do not match the query. */
+		if (index->indpred != NIL && !index->predOK)
+			continue;
+
+		/* NOTE: 现在只处理创建了btree索引的结构化条件。 */
+		if (index->relam != BTREE_AM_OID)
+			continue;
+
 		MemSet(&clauseset, 0, sizeof(clauseset));
-		// NOTE: 每个IndexOptInfo里面的indrestrictinfo成员和RelOptInfo的baserestrictinfo成员都指向同一个值，表示RelOptInfo上非连接的约束条件
-		foreach (lc, index->indrestrictinfo)
+
+		/* 
+		 * 每个IndexOptInfo里面的indrestrictinfo成员和RelOptInfo的baserestrictinfo成员都指向同一个值，
+		 * 表示RelOptInfo上非连接的约束条件。
+		 */
+		foreach (rcell, index->indrestrictinfo)
 		{
-			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, rcell);
+
+			/*
+			 * NOTE:
+			 * 因为还没有完全理解ScalarArrayOpExpr的处理方式，
+			 * 因此这里暂时不处理ScalarArrayOpExpr类型的约束条件。
+			 */
+			if (IsA(rinfo->clause, ScalarArrayOpExpr))
+			{
+				continue;
+			}
 
 			simple_match_clause_to_index(index, rinfo, &clauseset);
 		}
 		if (!clauseset.nonempty)
 			continue;
-
-		/*
-		 * 当有多个索引被匹配到时，选择率最低的索引为最优的索引
-		 * NOTE: 这里只估计单列属性的选择率，因为单列属性的选择率估计得比较准，多列属性的选择率目前估计得不是很准
+		
+		/* 
+		 * NOTE:
+		 * 目前单列属性的选择率估计得比较准，而多列属性的选择率估计得不是很准，
+		 * 因此暂时只使用单列属性的索引。
 		 */
- 		s = estimate_index_selectivity(root, baserel, index,
-									   &clauseset, &temp_index_quals);
-
-		// 只关注选择率，因为要通过结构化索引的结果去优化向量索引的搜索，结构化索引的选择率越低，向量索引的搜索越快！
-		if (selectivity > s)
+		for (int indexcol = 0; indexcol < INDEX_MAX_KEYS; indexcol++)
 		{
-			indexOpt = index;
-			indexQuals = temp_index_quals;
-			selectivity = s;
+			List *indexclause = clauseset.indexclauses[indexcol];
+			if (indexclause != NULL)
+				indrestrictcols++;
 		}
+		if (indrestrictcols > 1)
+			continue;
+		
+		index_path = create_structured_index_path(root, baserel, index, &clauseset);
+		lappend(index_paths, index_path);
 	}
 
-	if (indexOpt)
-	{
-		// 索引条件
-		if (p_indexConds)
-			*p_indexConds = indexQuals;  // TODO: indexConds和indexQuals已经傻傻分不清了，，，
-		// 索引（结果）约束
-		if (p_indexQuals)
-			*p_indexQuals = indexQuals;
-		if (p_selectivity)
-			*p_selectivity = selectivity;
-	}
-
-	return indexOpt;
-}
-
-/*
- * hybridquery_estimate_costs
- i*/
-static void
-hybridquery_estimate_costs(PlannerInfo *root,
-				  RelOptInfo *baserel,
-				  CustomPath *cpath)
-{
-	Path	   *path = &cpath->path;
-	// TODO:
-	
-	path->rows = 512;
-	path->startup_cost = 0.0;
-	path->total_cost = 0.0;
+	return index_paths;
 }
 
 /* 
@@ -1114,7 +858,7 @@ get_loop_count(PlannerInfo *root, Index cur_relid, Relids outer_relids)
 	((idxcollation) == InvalidOid || (idxcollation) == (exprcollation))
 
 static Expr *
-match_clause_to_ordering_op(IndexOptInfo *index,
+hybridquery_match_clause_to_ordering_op(IndexOptInfo *index,
 							int indexcol,
 							Expr *clause,
 							Oid pk_opfamily)
@@ -1202,7 +946,7 @@ match_clause_to_ordering_op(IndexOptInfo *index,
 }
 
 static void
-match_pathkeys_to_index(IndexOptInfo *index, List *pathkeys,
+hybridquery_match_pathkeys_to_index(IndexOptInfo *index, List *pathkeys,
 						List **orderby_clauses_p,
 						List **clause_columns_p)
 {
@@ -1229,6 +973,7 @@ match_pathkeys_to_index(IndexOptInfo *index, List *pathkeys,
 		 */
 
 		/* Pathkey must request default sort order for the target opfamily */
+		/* TODO: */
 		if (pathkey->pk_strategy != BTLessStrategyNumber ||
 			pathkey->pk_nulls_first)
 			return;
@@ -1265,7 +1010,7 @@ match_pathkeys_to_index(IndexOptInfo *index, List *pathkeys,
 			{
 				Expr	   *expr;
 
-				expr = match_clause_to_ordering_op(index,
+				expr = hybridquery_match_clause_to_ordering_op(index,
 												   indexcol,
 												   member->em_expr,
 												   pathkey->pk_opfamily);
@@ -1290,109 +1035,208 @@ match_pathkeys_to_index(IndexOptInfo *index, List *pathkeys,
 	*clause_columns_p = clause_columns;
 }
 
-static IndexPath *
-create_hybridquery_path(PlannerInfo *root,
-					RelOptInfo *rel,
-					IndexOptInfo *index)
+static Name
+GetIndexAmNameByAmOid(Oid amoid, bool noerror)
 {
-	List *index_clauses = NULL;
-	List *clause_columns = NULL;
-	List *orderbyclauses;
-	List *orderbyclausecols;
-	List *useful_pathkeys;
-	Relids outer_relids;
-	double loop_count;
+	HeapTuple tuple;
+	Form_pg_am amform;
+	Name amname;
 
+	tuple = SearchSysCache1(AMOID, ObjectIdGetDatum(amoid));
+	if (!HeapTupleIsValid(tuple))
+	{
+		if (noerror)
+			return NULL;
+		elog(ERROR, "cache lookup failed for access method %u",
+			 amoid);
+	}
+	amform = (Form_pg_am)GETSTRUCT(tuple);
+
+	/* Check if it's an index access method as opposed to some other AM */
+	if (amform->amtype != AMTYPE_INDEX)
+	{
+		if (noerror)
+		{
+			ReleaseSysCache(tuple);
+			return NULL;
+		}
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("access method \"%s\" is not of type %s",
+						NameStr(amform->amname), "INDEX")));
+	}
+
+	amname = &(amform->amname);
+
+	ReleaseSysCache(tuple);
+
+	return amname;
+}
+
+static Oid
+GetIndexAmOidByAmName(const char *amname)
+{
+	Oid amoid;
+	HeapTuple tuple;
+
+	tuple = SearchSysCache1(AMNAME, PointerGetDatum(amname));
+	if (!HeapTupleIsValid(tuple))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				errmsg("access method \"%s\" does not exist", amname)));
+	amoid = HeapTupleGetOid(tuple);
+
+	return amoid;
+}
+
+bool
+is_anns_index(Oid amoid)
+{
+	Name amname = GetIndexAmNameByAmOid(amoid, true);
+
+	if (!amname)
+		return false;
+	
+	char *amname_str = amname->data;
+
+	/* NOTE: 现在只有pg_ivfpq索引支持联合查询。*/
+	if (strcmp("pg_ivfpq", amname_str) == 0)
+		return true;
+	else
+		return false;
+}
+
+static IndexPath *
+create_anns_index_path(PlannerInfo *root,
+					   IndexOptInfo *index,
+					   List *orderbyclauses,
+					   List *orderbyclausecols)
+{
 	IndexPath *ipath;
 
-	// TODO: 不支持LA
-	outer_relids = bms_copy(rel->lateral_relids);
-	outer_relids = bms_del_member(outer_relids, rel->relid);
-	if (bms_is_empty(outer_relids))
-		outer_relids = NULL;
-	loop_count = get_loop_count(root, rel->relid, outer_relids);
-
-	/* see if we can generate ordering operators for query_pathkeys */
-	match_pathkeys_to_index(index, root->query_pathkeys,
-							&orderbyclauses,
-							&orderbyclausecols);
-	if (orderbyclauses)
-		useful_pathkeys = root->query_pathkeys;
-	else
-		elog(ERROR, "Never be here");
-
+	/*
+	 * NOTE:
+	 * 1. 向量索引扫描方向只能设置为NoMovementScanDirection；
+	 * 2. 向量索引目前不支持T_IndexOnlyScan，因此只能创建T_IndexScan。
+	 */
 	ipath = create_index_path(root, index,
-							index_clauses,
-							clause_columns,
+							NIL,
+							NIL,
 							orderbyclauses,
 							orderbyclausecols,
-							useful_pathkeys,
-							NoMovementScanDirection,
-							false,
-							outer_relids,
-							loop_count,
+							root->query_pathkeys,
+							NoMovementScanDirection,	// NoMovementScanDirection
+							false,						// T_IndexScan
+							NULL,
+							1.0,
 							false);
 
 	return ipath;
 }
 
-static IndexPath *
-create_structured_path(PlannerInfo *root,
-					RelOptInfo *rel,
-					IndexOptInfo *index,
-					IndexClauseSet *clauseset)
+static List *
+find_anns_index_paths(PlannerInfo *root,
+					  RelOptInfo *baserel)
 {
-	List *index_clauses = NULL;
-	List *clause_columns = NULL;
-	List *orderbyclauses;
-	List *orderbyclausecols;
-	List *useful_pathkeys;
-	Relids outer_relids;
-	double loop_count;
-	bool index_is_ordered;
+	List		*index_paths = NIL;
+	ListCell	*icell;
 
-	IndexPath *ipath;
+	/* skip if no indexes */
+	if (baserel->indexlist == NIL)
+		return NULL;
 
-	outer_relids = bms_copy(rel->lateral_relids);
-
-	ListCell   *lc;
-
-	foreach(lc, clauseset->indexclauses[0])
+	foreach (icell, baserel->indexlist)
 	{
-		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+		IndexOptInfo	*index = (IndexOptInfo *) lfirst(icell);
+		IndexPath		*index_path;
+		List			*orderbyclauses;
+		List			*orderbyclausecols;
 
-		index_clauses = lappend(index_clauses, rinfo);
-		clause_columns = lappend_int(clause_columns, 0);
-		outer_relids = bms_add_members(outer_relids,
-										rinfo->clause_relids);
+		/* Protect limited-size array in IndexClauseSets */
+		Assert(index->ncolumns <= INDEX_MAX_KEYS);
+
+		/* Ignore partial indexes that do not match the query. */
+		if (index->indpred != NIL && !index->predOK)
+			continue;
+		
+		if (!is_anns_index(index->relam))
+			continue;
+
+		/* see if we can generate ordering operators for query_pathkeys */
+		hybridquery_match_pathkeys_to_index(index, root->query_pathkeys,
+								&orderbyclauses,
+								&orderbyclausecols);
+		if (orderbyclauses != NIL && \
+			orderbyclausecols != NIL)
+			continue;
+		
+		index_path = create_anns_index_path(root, baserel, index, orderbyclauses, orderbyclausecols);
+		lappend(index_paths, index_path);
 	}
 
-	outer_relids = bms_del_member(outer_relids, rel->relid);
-	if (bms_is_empty(outer_relids))
-		outer_relids = NULL;
-	loop_count = get_loop_count(root, rel->relid, outer_relids);
+	return index_paths;
+}
 
-	index_is_ordered = (index->sortopfamily != NULL);
+static bool
+find_best_paths(List *structured_index_paths, List *anns_index_paths,
+				List **p_best_structured_index_path, List **p_best_anns_index_path)
+{
+	bool		 use_hybridquery = false;
+	IndexPath	*best_structured_index_path = NIL;
+	IndexPath	*best_anns_index_path = NIL;
+	ListCell	*lc;
 
-	useful_pathkeys = NIL;
-	orderbyclauses = NIL;
-	orderbyclausecols = NIL;
+	/* 
+	 * NOTE:
+	 * 这里只关注选择率，因为要通过结构化索引的结果去优化向量索引的搜索，
+	 * 结构化索引的选择率越低，向量索引的搜索越快。
+	 */
+	Selectivity best_selectivity = 1.0;
+	foreach (lc, structured_index_paths)
+	{
+		IndexPath *index_path = (IndexPath *)lfirst(lc);
+		if (best_selectivity > index_path->indexselectivity)
+		{
+			best_selectivity = index_path->indexselectivity;
+			best_structured_index_path = index_path;
+		}
+	}
 
-	ipath = create_index_path(root, index,
-							index_clauses,
-							clause_columns,
-							orderbyclauses,
-							orderbyclausecols,
-							useful_pathkeys,
-							index_is_ordered ?
-							ForwardScanDirection :
-							NoMovementScanDirection,
-							false,
-							outer_relids,
-							loop_count,
-							false);
+	Cost best_anns_cost = DBL_MAX;
+	foreach (lc, anns_index_paths)
+	{
+		IndexPath *index_path = (IndexPath *)lfirst(lc);
+		if (best_anns_cost > index_path->indextotalcost)
+		{
+			best_anns_cost = index_path->indextotalcost;
+			best_anns_index_path = index_path;
+		}
+	}
 
-	return ipath;
+	int32 n = 1000000;
+	int32 ni = 64;
+	Cost anns_structured_cost;
+	Cost structured_anns_cost;
+	anns_structured_cost = (128.0 / 512.0) * n * cost_from_distance_tables;
+	structured_anns_cost = best_structured_index_path->indextotalcost + best_selectivity * n * cost_from_distance_tables;
+
+	Cost anns_structured_anns_io_cost;
+	Cost structured_anns_anns_io_cost;
+	anns_structured_anns_io_cost = (128.0 / 512.0) * ((float)n / ni) * DEFAULT_SEQ_PAGE_COST;
+	structured_anns_anns_io_cost = best_selectivity * n * DEFAULT_RANDOM_PAGE_COST;
+
+	anns_structured_cost += anns_structured_anns_io_cost;
+	structured_anns_cost += structured_anns_anns_io_cost;
+
+	if (anns_structured_cost > structured_anns_cost)
+	{
+		use_hybridquery = true;
+		// TODO: 更新结构化索引和向量索引的cost
+		*p_best_structured_index_path = best_structured_index_path;
+		*p_best_anns_index_path = best_anns_index_path;
+	}
+
+	return use_hybridquery;
 }
 
 /*
@@ -1402,72 +1246,78 @@ static void
 set_hybridquery_path(PlannerInfo *root, RelOptInfo *baserel,
 				Index rtindex, RangeTblEntry *rte)
 {
-	char			relkind;
+	CustomPath	*cpath;
+	List		*structured_index_paths;
+	List		*anns_index_paths;
+	// NOTE: 如果进行联合查询，向量索引肯定是最后执行的。
+	IndexPath	*best_structured_index_path = NIL;
+	IndexPath	*best_anns_index_path = NIL;
+	bool		 use_hybridquery;
 
-	IndexOptInfo	*anns_indexOpt;
-	IndexPath		*anns_pathnode;
+	/* 
+	 * 使用联合查询的条件：
+	 * 1. 从原始表查询；
+	 * 2. 联合查询开启；
+	 * 3. 查询能使用结构化索引；
+	 * 4. 查询能使用向量索引；
+	 * 5. 联合查询的代价比非联合查询的代价低。
+	 */
 
-	IndexOptInfo	*quals_indexOpt;
-	IndexPath		*quals_pathnode;
-	List			*indexConds;
-	List			*indexQuals;
-	Selectivity		selectivity;
-
-	CustomPath		*cpath;
-
-	/* only plain relations are supported */
-	if (rte->rtekind != RTE_RELATION)
+	// 1. 从原始表查询
+	if (baserel->rtekind != RTE_RELATION || \
+		rte->rtekind != RTE_RELATION)
 		return;
-	relkind = get_rel_relkind(rte->relid);
-	if (relkind != RELKIND_RELATION)
-		return;
 
+	// 2. 联合查询开启；
 	if (!enable_hybridquery)
 		return;
-
-	// TODO: 是否能进行联合查询，不能，则直接返回，即使用PG规划的路径（ANNS+Filter）
-	// 能进行联合查询的条件：1. 有ANNS查询；2. 带约束条件；3. 约束条件+ANNS查询的代价比ANNS+Filter的代价低。
-	// 步骤：1. 找到约束条件中的索引和对应的约束条件；2. 从这些索引中选择选择率最低的索引；3. 构建对应的索引。
 	
-	// 1. 结构化索引
-	// TODO: 变量名、函数名更改
-	List *structuered_indexes;
-	List *structuered_clauses;
-	IndexOptInfo *best_structured_index;
-	List		 *best_structured_clauses;
-	structuered_indexes = tryfind_structured_index(root, baserel, &structuered_clauses);
-	quals_pathnode = create_structured_path(root, baserel, quals_indexOpt, &clauseset);
-
-	if (quals_indexOpt == NULL)
+	// 3. 结构化索引
+	structured_index_paths = find_structured_index_paths(root, baserel);
+	if (structured_index_paths->length == 0)
 		return;
 	
-	// 2. 向量索引
-	// TODO: 变量名、函数名更改
-	anns_indexOpt = tryfind_anns_index(root, baserel);
-	anns_pathnode = create_hybridquery_path(root, baserel, anns_indexOpt);
-
-	if (anns_indexOpt == NULL)
+	// 4. 向量索引
+	anns_index_paths = find_anns_index_paths(root, baserel);
+	if (anns_index_paths->length == 0)
+		return;
+	
+	// 5. 联合查询的代价比非联合查询的代价低
+	use_hybridquery = find_best_paths(structured_index_paths, anns_index_paths,
+									  &best_structured_index_path, &best_anns_index_path);
+	// 是否进行联合查询，不使用联合查询则直接返回，此时会使用PostgreSQL规划的路径。
+	if (!use_hybridquery)
 		return;
 
-	// TODO: 计算约束条件+ANNS查询的代价；计算ANNS+Filter的代价；如果前者比后者高，直接返回，否则，进行联合查询
-
-	// 3. 填充CustomPath数据结构，并把上一步得到IndexPath数据结构保存到custom_private成员中
+	// 填充CustomPath数据结构，并将best_structured_path和best_anns_path放到CustomPath中。
 	cpath = makeNode(CustomPath);
 	cpath->path.pathtype = T_CustomScan;
+
 	cpath->path.parent = baserel;
 	cpath->path.pathtarget = baserel->reltarget;
+
+	// TODO: 搞清楚这里
 	cpath->path.param_info = get_baserel_parampathinfo(root, baserel,
-										   baserel->lateral_relids);
-	
-	hybridquery_estimate_costs(root, baserel, cpath);
+													   baserel->lateral_relids);
+	// NOTE: 暂时不支持并行查询
+	cpath->path.parallel_aware = false;
+	cpath->path.parallel_safe = baserel->consider_parallel;
+	cpath->path.parallel_workers = 0;
+
+	// TODO: 待确认startup_cost和total_cost这样设置是否正确
+	cpath->path.rows = 512;  // TODO: be fixed to 512 now and to be fixed later.
+	cpath->path.startup_cost = best_structured_index_path->indextotalcost;
+	cpath->path.total_cost = best_anns_index_path->indextotalcost;
 
 	cpath->path.pathkeys = root->query_pathkeys;
+
 	cpath->flags = 0;
-	cpath->custom_paths = list_make1(quals_pathnode);
-	cpath->custom_private = list_make1(anns_pathnode);
+	cpath->custom_paths = list_make2(best_structured_index_path, best_anns_index_path);
+	cpath->custom_private = NULL;
 	cpath->methods = &hybridquery_path_methods;
 
-	add_path(baserel, &cpath->path);  // 其实就是传递的CustomPath的指针，只是为了达到类似C++的多态效果
+	// 将CustomPath（即联合查询的最优路径）添加到baserel的pathlist中。
+	add_path(baserel, &cpath->path);  // 其实就是传递的CustomPath的指针，这样做是为了达到类似C++的多态效果。
 }
 
 static Node *
@@ -2130,24 +1980,28 @@ PlanHybridQueryPath(PlannerInfo *root,
 				 List *clauses,
 				 List *custom_plans)
 {
-	CustomScan	   *cscan = makeNode(CustomScan);
+	CustomScan	*cscan = makeNode(CustomScan);
+	IndexPath	*structured_ipath;
+	IndexPath	*anns_ipath;
+	IndexScan	*structured_indexscan;
+	IndexScan	*anns_indexscan;
 
-	IndexPath *quals_ipath = (IndexPath *) lfirst(list_head(best_path->custom_paths));
-	IndexPath *anns_ipath = (IndexPath *) lfirst(list_head(best_path->custom_private));
+	structured_ipath = (IndexPath *) lfirst(list_head(best_path->custom_paths));
+	anns_ipath = (IndexPath *) lfirst(list_tail(best_path->custom_private));
 
-	IndexScan *quals_indexscan;
-	quals_indexscan = (IndexScan *)hybridquery_create_indexscan_plan(root, quals_ipath, tlist, clauses, false);
+	
+	structured_indexscan = (IndexScan *)hybridquery_create_indexscan_plan(root, structured_ipath, tlist, clauses, false);
 
 	// 1. 以createplan.c中create_indexscan_plan函数的方式，调用make_indexscan创建Scan对象（实际上是Plan的子类），
 	// make_indexscan函数需要的参数存放在CustomPath中，而CustomPath会在create_hybridquery_path被填充。
-	IndexScan	   *anns_indexscan;
+	
 	anns_indexscan = (IndexScan *)hybridquery_create_indexscan_plan(root, anns_ipath, tlist, clauses, false);
 
 	// 2. 填充CustomScan
 	cscan->scan = anns_indexscan->scan;  // TODO: 基类的成员该使用什么值进行初始化？暂时使用的向量索引对应的IndexScan的基类进行初始化的
 	NodeSetTag(cscan, T_CustomScan);
 	cscan->flags = best_path->flags;
-	cscan->custom_plans = list_make1(quals_indexscan);  // 保存结构化索引的IndexScan到CustomScan
+	cscan->custom_plans = list_make1(structured_indexscan);  // 保存结构化索引的IndexScan到CustomScan
 	cscan->custom_private = list_make1(anns_indexscan);  // 保存IndexScan到CustomScan
 	cscan->methods = &hybridquery_scan_methods;
 
@@ -2632,9 +2486,29 @@ _PG_init(void)
 							 GUC_NOT_IN_SAMPLE,
 							 NULL, NULL, NULL);
 	
-	// TODO: 添加GUC参数：计算distance table和一条pq code之间的距离的cost
+	// 计算distance tables和一条pq code之间的距离的cost
+	DefineCustomRealVariable("cost_from_distance_tables",
+							 "Cost of compute distance from distance tables",
+							 NULL,
+							 &cost_from_distance_tables,
+							 DEFAULT_CPU_OPERATOR_COST / 32.0,
+							 0,
+							 DBL_MAX,
+							 PGC_USERSET,
+							 GUC_NOT_IN_SAMPLE,
+							 NULL, NULL, NULL);
 
-	// TODO: 添加GUC参数：计算索引中任意一条pq code与一个原始向量之间的距离的cost
+	// 计算索引中任意一条pq code与一个原始向量之间的距离的cost
+	DefineCustomRealVariable("cost_from_two_codes",
+							 "Cost of compute distance from two codes",
+							 NULL,
+							 &cost_from_two_codes,
+							 DEFAULT_CPU_OPERATOR_COST / 16.0,
+							 0,
+							 DBL_MAX,
+							 PGC_USERSET,
+							 GUC_NOT_IN_SAMPLE,
+							 NULL, NULL, NULL);
 
 	/* registration of the hook to add alternative path */
 	set_rel_pathlist_next = set_rel_pathlist_hook;
