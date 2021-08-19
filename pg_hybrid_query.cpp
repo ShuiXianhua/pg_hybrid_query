@@ -48,38 +48,15 @@ extern "C"
 #include "utils/selfuncs.h"
 #include "utils/syscache.h"
 
+#include <float.h>
+
 PG_MODULE_MAGIC;
 
 /*
  * HybridQueryState
  */
 typedef struct {
-	CustomScanState	css;
-	IndexScan  *quals_is;
-	IndexScan  *anns_is;
-	IndexScanState *quals_iss;
-	IndexScanState *anns_iss;
-	ExprState  *indexqualorig;
-	List	   *indexorderbyorig;
-	ScanKey		iss_ScanKeys;
-	int			iss_NumScanKeys;
-	ScanKey		iss_OrderByKeys;
-	int			iss_NumOrderByKeys;
-	IndexRuntimeKeyInfo *iss_RuntimeKeys;
-	int			iss_NumRuntimeKeys;
-	bool		iss_RuntimeKeysReady;
-	ExprContext *iss_RuntimeContext;
-	Relation	iss_RelationDesc;
-	IndexScanDesc iss_ScanDesc;
-
-	pairingheap *iss_ReorderQueue;
-	bool		iss_ReachedEnd;
-	Datum	   *iss_OrderByValues;
-	bool	   *iss_OrderByNulls;
-	SortSupport iss_SortSupport;
-	bool	   *iss_OrderByTypByVals;
-	int16	   *iss_OrderByTypLens;
-	Size		iss_PscanLen;
+	CustomScanState		css;
 } HybridQueryState;
 
 /* static variables */
@@ -377,210 +354,210 @@ deconstruct_indexquals_for_hybridquery(IndexOptInfo *index, List *index_quals, L
 	return result;
 }
 
-static void
-genericcostestimate_for_hybridquery(PlannerInfo *root,
-					IndexOptInfo *index,
-					List *indexQuals,
-					List *qinfos,
-					GenericCosts *costs)
-{
-	// IndexOptInfo *index = path->indexinfo;
-	// List	   *indexQuals = path->indexquals;
-	// List	   *indexOrderBys = path->indexorderbys;
-	Cost		indexStartupCost;
-	Cost		indexTotalCost;
-	Selectivity indexSelectivity;
-	double		indexCorrelation;
-	double		numIndexPages;
-	double		numIndexTuples;
-	double		spc_random_page_cost;
-	double		num_sa_scans;
-	double		num_outer_scans;
-	double		num_scans;
-	double		qual_op_cost;
-	double		qual_arg_cost;
-	List	   *selectivityQuals;
-	ListCell   *l;
+// static void
+// genericcostestimate_for_hybridquery(PlannerInfo *root,
+// 					IndexOptInfo *index,
+// 					List *indexQuals,
+// 					List *qinfos,
+// 					GenericCosts *costs)
+// {
+// 	// IndexOptInfo *index = path->indexinfo;
+// 	// List	   *indexQuals = path->indexquals;
+// 	// List	   *indexOrderBys = path->indexorderbys;
+// 	Cost		indexStartupCost;
+// 	Cost		indexTotalCost;
+// 	Selectivity indexSelectivity;
+// 	double		indexCorrelation;
+// 	double		numIndexPages;
+// 	double		numIndexTuples;
+// 	double		spc_random_page_cost;
+// 	double		num_sa_scans;
+// 	double		num_outer_scans;
+// 	double		num_scans;
+// 	double		qual_op_cost;
+// 	double		qual_arg_cost;
+// 	List	   *selectivityQuals;
+// 	ListCell   *l;
 
-	/*
-	 * If the index is partial, AND the index predicate with the explicitly
-	 * given indexquals to produce a more accurate idea of the index
-	 * selectivity.
-	 */
-	selectivityQuals = add_predicate_to_quals(index, indexQuals);
+// 	/*
+// 	 * If the index is partial, AND the index predicate with the explicitly
+// 	 * given indexquals to produce a more accurate idea of the index
+// 	 * selectivity.
+// 	 */
+// 	selectivityQuals = add_predicate_to_quals(index, indexQuals);
 
-	/*
-	 * Check for ScalarArrayOpExpr index quals, and estimate the number of
-	 * index scans that will be performed.
-	 */
-	num_sa_scans = 1;
-	foreach(l, indexQuals)
-	{
-		RestrictInfo *rinfo = (RestrictInfo *) lfirst(l);
+// 	/*
+// 	 * Check for ScalarArrayOpExpr index quals, and estimate the number of
+// 	 * index scans that will be performed.
+// 	 */
+// 	num_sa_scans = 1;
+// 	foreach(l, indexQuals)
+// 	{
+// 		RestrictInfo *rinfo = (RestrictInfo *) lfirst(l);
 
-		if (IsA(rinfo->clause, ScalarArrayOpExpr))
-		{
-			ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) rinfo->clause;
-			int			alength = estimate_array_length(lsecond(saop->args));
+// 		if (IsA(rinfo->clause, ScalarArrayOpExpr))
+// 		{
+// 			ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) rinfo->clause;
+// 			int			alength = estimate_array_length(lsecond(saop->args));
 
-			if (alength > 1)
-				num_sa_scans *= alength;
-		}
-	}
+// 			if (alength > 1)
+// 				num_sa_scans *= alength;
+// 		}
+// 	}
 
-	/* Estimate the fraction of main-table tuples that will be visited */
-	indexSelectivity = clauselist_selectivity(root, selectivityQuals,
-											  index->rel->relid,
-											  JOIN_INNER,
-											  NULL);
+// 	/* Estimate the fraction of main-table tuples that will be visited */
+// 	indexSelectivity = clauselist_selectivity(root, selectivityQuals,
+// 											  index->rel->relid,
+// 											  JOIN_INNER,
+// 											  NULL);
 
-	/*
-	 * If caller didn't give us an estimate, estimate the number of index
-	 * tuples that will be visited.  We do it in this rather peculiar-looking
-	 * way in order to get the right answer for partial indexes.
-	 */
-	numIndexTuples = costs->numIndexTuples;
-	if (numIndexTuples <= 0.0)
-	{
-		numIndexTuples = indexSelectivity * index->rel->tuples;
+// 	/*
+// 	 * If caller didn't give us an estimate, estimate the number of index
+// 	 * tuples that will be visited.  We do it in this rather peculiar-looking
+// 	 * way in order to get the right answer for partial indexes.
+// 	 */
+// 	numIndexTuples = costs->numIndexTuples;
+// 	if (numIndexTuples <= 0.0)
+// 	{
+// 		numIndexTuples = indexSelectivity * index->rel->tuples;
 
-		/*
-		 * The above calculation counts all the tuples visited across all
-		 * scans induced by ScalarArrayOpExpr nodes.  We want to consider the
-		 * average per-indexscan number, so adjust.  This is a handy place to
-		 * round to integer, too.  (If caller supplied tuple estimate, it's
-		 * responsible for handling these considerations.)
-		 */
-		numIndexTuples = rint(numIndexTuples / num_sa_scans);
-	}
+// 		/*
+// 		 * The above calculation counts all the tuples visited across all
+// 		 * scans induced by ScalarArrayOpExpr nodes.  We want to consider the
+// 		 * average per-indexscan number, so adjust.  This is a handy place to
+// 		 * round to integer, too.  (If caller supplied tuple estimate, it's
+// 		 * responsible for handling these considerations.)
+// 		 */
+// 		numIndexTuples = rint(numIndexTuples / num_sa_scans);
+// 	}
 
-	/*
-	 * We can bound the number of tuples by the index size in any case. Also,
-	 * always estimate at least one tuple is touched, even when
-	 * indexSelectivity estimate is tiny.
-	 */
-	if (numIndexTuples > index->tuples)
-		numIndexTuples = index->tuples;
-	if (numIndexTuples < 1.0)
-		numIndexTuples = 1.0;
+// 	/*
+// 	 * We can bound the number of tuples by the index size in any case. Also,
+// 	 * always estimate at least one tuple is touched, even when
+// 	 * indexSelectivity estimate is tiny.
+// 	 */
+// 	if (numIndexTuples > index->tuples)
+// 		numIndexTuples = index->tuples;
+// 	if (numIndexTuples < 1.0)
+// 		numIndexTuples = 1.0;
 
-	/*
-	 * Estimate the number of index pages that will be retrieved.
-	 *
-	 * We use the simplistic method of taking a pro-rata fraction of the total
-	 * number of index pages.  In effect, this counts only leaf pages and not
-	 * any overhead such as index metapage or upper tree levels.
-	 *
-	 * In practice access to upper index levels is often nearly free because
-	 * those tend to stay in cache under load; moreover, the cost involved is
-	 * highly dependent on index type.  We therefore ignore such costs here
-	 * and leave it to the caller to add a suitable charge if needed.
-	 */
-	if (index->pages > 1 && index->tuples > 1)
-		numIndexPages = ceil(numIndexTuples * index->pages / index->tuples);
-	else
-		numIndexPages = 1.0;
+// 	/*
+// 	 * Estimate the number of index pages that will be retrieved.
+// 	 *
+// 	 * We use the simplistic method of taking a pro-rata fraction of the total
+// 	 * number of index pages.  In effect, this counts only leaf pages and not
+// 	 * any overhead such as index metapage or upper tree levels.
+// 	 *
+// 	 * In practice access to upper index levels is often nearly free because
+// 	 * those tend to stay in cache under load; moreover, the cost involved is
+// 	 * highly dependent on index type.  We therefore ignore such costs here
+// 	 * and leave it to the caller to add a suitable charge if needed.
+// 	 */
+// 	if (index->pages > 1 && index->tuples > 1)
+// 		numIndexPages = ceil(numIndexTuples * index->pages / index->tuples);
+// 	else
+// 		numIndexPages = 1.0;
 
-	/* fetch estimated page cost for tablespace containing index */
-	get_tablespace_page_costs(index->reltablespace,
-							  &spc_random_page_cost,
-							  NULL);
+// 	/* fetch estimated page cost for tablespace containing index */
+// 	get_tablespace_page_costs(index->reltablespace,
+// 							  &spc_random_page_cost,
+// 							  NULL);
 
-	/*
-	 * Now compute the disk access costs.
-	 *
-	 * The above calculations are all per-index-scan.  However, if we are in a
-	 * nestloop inner scan, we can expect the scan to be repeated (with
-	 * different search keys) for each row of the outer relation.  Likewise,
-	 * ScalarArrayOpExpr quals result in multiple index scans.  This creates
-	 * the potential for cache effects to reduce the number of disk page
-	 * fetches needed.  We want to estimate the average per-scan I/O cost in
-	 * the presence of caching.
-	 *
-	 * We use the Mackert-Lohman formula (see costsize.c for details) to
-	 * estimate the total number of page fetches that occur.  While this
-	 * wasn't what it was designed for, it seems a reasonable model anyway.
-	 * Note that we are counting pages not tuples anymore, so we take N = T =
-	 * index size, as if there were one "tuple" per page.
-	 */
-	// NOTE: loop_count恒等于1
-	// num_outer_scans = loop_count;
-	num_outer_scans = 1;
-	num_scans = num_sa_scans * num_outer_scans;
+// 	/*
+// 	 * Now compute the disk access costs.
+// 	 *
+// 	 * The above calculations are all per-index-scan.  However, if we are in a
+// 	 * nestloop inner scan, we can expect the scan to be repeated (with
+// 	 * different search keys) for each row of the outer relation.  Likewise,
+// 	 * ScalarArrayOpExpr quals result in multiple index scans.  This creates
+// 	 * the potential for cache effects to reduce the number of disk page
+// 	 * fetches needed.  We want to estimate the average per-scan I/O cost in
+// 	 * the presence of caching.
+// 	 *
+// 	 * We use the Mackert-Lohman formula (see costsize.c for details) to
+// 	 * estimate the total number of page fetches that occur.  While this
+// 	 * wasn't what it was designed for, it seems a reasonable model anyway.
+// 	 * Note that we are counting pages not tuples anymore, so we take N = T =
+// 	 * index size, as if there were one "tuple" per page.
+// 	 */
+// 	// NOTE: loop_count恒等于1
+// 	// num_outer_scans = loop_count;
+// 	num_outer_scans = 1;
+// 	num_scans = num_sa_scans * num_outer_scans;
 
-	if (num_scans > 1)
-	{
-		double		pages_fetched;
+// 	if (num_scans > 1)
+// 	{
+// 		double		pages_fetched;
 
-		/* total page fetches ignoring cache effects */
-		pages_fetched = numIndexPages * num_scans;
+// 		/* total page fetches ignoring cache effects */
+// 		pages_fetched = numIndexPages * num_scans;
 
-		/* use Mackert and Lohman formula to adjust for cache effects */
-		pages_fetched = index_pages_fetched(pages_fetched,
-											index->pages,
-											(double) index->pages,
-											root);
+// 		/* use Mackert and Lohman formula to adjust for cache effects */
+// 		pages_fetched = index_pages_fetched(pages_fetched,
+// 											index->pages,
+// 											(double) index->pages,
+// 											root);
 
-		/*
-		 * Now compute the total disk access cost, and then report a pro-rated
-		 * share for each outer scan.  (Don't pro-rate for ScalarArrayOpExpr,
-		 * since that's internal to the indexscan.)
-		 */
-		indexTotalCost = (pages_fetched * spc_random_page_cost)
-			/ num_outer_scans;
-	}
-	else
-	{
-		/*
-		 * For a single index scan, we just charge spc_random_page_cost per
-		 * page touched.
-		 */
-		indexTotalCost = numIndexPages * spc_random_page_cost;
-	}
+// 		/*
+// 		 * Now compute the total disk access cost, and then report a pro-rated
+// 		 * share for each outer scan.  (Don't pro-rate for ScalarArrayOpExpr,
+// 		 * since that's internal to the indexscan.)
+// 		 */
+// 		indexTotalCost = (pages_fetched * spc_random_page_cost)
+// 			/ num_outer_scans;
+// 	}
+// 	else
+// 	{
+// 		/*
+// 		 * For a single index scan, we just charge spc_random_page_cost per
+// 		 * page touched.
+// 		 */
+// 		indexTotalCost = numIndexPages * spc_random_page_cost;
+// 	}
 
-	/*
-	 * CPU cost: any complex expressions in the indexquals will need to be
-	 * evaluated once at the start of the scan to reduce them to runtime keys
-	 * to pass to the index AM (see nodeIndexscan.c).  We model the per-tuple
-	 * CPU costs as cpu_index_tuple_cost plus one cpu_operator_cost per
-	 * indexqual operator.  Because we have numIndexTuples as a per-scan
-	 * number, we have to multiply by num_sa_scans to get the correct result
-	 * for ScalarArrayOpExpr cases.  Similarly add in costs for any index
-	 * ORDER BY expressions.
-	 *
-	 * Note: this neglects the possible costs of rechecking lossy operators.
-	 * Detecting that that might be needed seems more expensive than it's
-	 * worth, though, considering all the other inaccuracies here ...
-	 */
-	// NOTE: 直接去掉order by的代价
-	// qual_arg_cost = other_operands_eval_cost(root, qinfos) +
-	// 	orderby_operands_eval_cost(root, path);
-	// qual_op_cost = cpu_operator_cost *
-	// 	(list_length(indexQuals) + list_length(indexOrderBys));
-	qual_arg_cost = other_operands_eval_cost(root, qinfos);
-	qual_op_cost = cpu_operator_cost * list_length(indexQuals);
+// 	/*
+// 	 * CPU cost: any complex expressions in the indexquals will need to be
+// 	 * evaluated once at the start of the scan to reduce them to runtime keys
+// 	 * to pass to the index AM (see nodeIndexscan.c).  We model the per-tuple
+// 	 * CPU costs as cpu_index_tuple_cost plus one cpu_operator_cost per
+// 	 * indexqual operator.  Because we have numIndexTuples as a per-scan
+// 	 * number, we have to multiply by num_sa_scans to get the correct result
+// 	 * for ScalarArrayOpExpr cases.  Similarly add in costs for any index
+// 	 * ORDER BY expressions.
+// 	 *
+// 	 * Note: this neglects the possible costs of rechecking lossy operators.
+// 	 * Detecting that that might be needed seems more expensive than it's
+// 	 * worth, though, considering all the other inaccuracies here ...
+// 	 */
+// 	// NOTE: 直接去掉order by的代价
+// 	// qual_arg_cost = other_operands_eval_cost(root, qinfos) +
+// 	// 	orderby_operands_eval_cost(root, path);
+// 	// qual_op_cost = cpu_operator_cost *
+// 	// 	(list_length(indexQuals) + list_length(indexOrderBys));
+// 	qual_arg_cost = other_operands_eval_cost(root, qinfos);
+// 	qual_op_cost = cpu_operator_cost * list_length(indexQuals);
 
-	indexStartupCost = qual_arg_cost;
-	indexTotalCost += qual_arg_cost;
-	indexTotalCost += numIndexTuples * num_sa_scans * (cpu_index_tuple_cost + qual_op_cost);
+// 	indexStartupCost = qual_arg_cost;
+// 	indexTotalCost += qual_arg_cost;
+// 	indexTotalCost += numIndexTuples * num_sa_scans * (cpu_index_tuple_cost + qual_op_cost);
 
-	/*
-	 * Generic assumption about index correlation: there isn't any.
-	 */
-	indexCorrelation = 0.0;
+// 	/*
+// 	 * Generic assumption about index correlation: there isn't any.
+// 	 */
+// 	indexCorrelation = 0.0;
 
-	/*
-	 * Return everything to caller.
-	 */
-	costs->indexStartupCost = indexStartupCost;
-	costs->indexTotalCost = indexTotalCost;
-	costs->indexSelectivity = indexSelectivity;
-	costs->indexCorrelation = indexCorrelation;
-	costs->numIndexPages = numIndexPages;
-	costs->numIndexTuples = numIndexTuples;
-	costs->spc_random_page_cost = spc_random_page_cost;
-	costs->num_sa_scans = num_sa_scans;
-}
+// 	/*
+// 	 * Return everything to caller.
+// 	 */
+// 	costs->indexStartupCost = indexStartupCost;
+// 	costs->indexTotalCost = indexTotalCost;
+// 	costs->indexSelectivity = indexSelectivity;
+// 	costs->indexCorrelation = indexCorrelation;
+// 	costs->numIndexPages = numIndexPages;
+// 	costs->numIndexTuples = numIndexTuples;
+// 	costs->spc_random_page_cost = spc_random_page_cost;
+// 	costs->num_sa_scans = num_sa_scans;
+// }
 
 static IndexPath *
 create_structured_index_path(PlannerInfo *root,
@@ -604,11 +581,13 @@ create_structured_index_path(PlannerInfo *root,
 	bool	   index_only_scan;
 	int		   indexcol;
 
+	index_clauses = NIL;
+	clause_columns = NIL;
 	for (indexcol = 0; indexcol < index->ncolumns; indexcol++)
 	{
 		ListCell   *lc;
 
-		foreach (lc, clauses->indexclauses[indexcol])
+		foreach (lc, clauseset->indexclauses[indexcol])
 		{
 			RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
 
@@ -617,7 +596,7 @@ create_structured_index_path(PlannerInfo *root,
 		}
 
 		if (index_clauses == NIL && !index->amoptionalkey)
-			return NIL;
+			return NULL;
 	}
 
 	/* 忽略结构化条件的ORDER BY表达式 */
@@ -637,7 +616,7 @@ create_structured_index_path(PlannerInfo *root,
 							NIL,
 							useful_pathkeys,
 							ForwardScanDirection,	// ForwardScanDirection
-							true,					// T_IndexOnlyScan
+							false,					// T_IndexScan
 							NULL,
 							1.0,
 							false);
@@ -660,7 +639,7 @@ find_structured_index_paths(PlannerInfo *root,
 
 	/* skip if no indexes */
 	if (baserel->indexlist == NIL)
-		return NULL;
+		return NIL;
 
 	foreach (icell, baserel->indexlist)
 	{
@@ -684,7 +663,9 @@ find_structured_index_paths(PlannerInfo *root,
 		MemSet(&clauseset, 0, sizeof(clauseset));
 
 		/* 
-		 * 每个IndexOptInfo里面的indrestrictinfo成员和RelOptInfo的baserestrictinfo成员都指向同一个值，
+		 * 对于一个非局部索引（non-partial index），
+		 * 每个IndexOptInfo里面的indrestrictinfo成员和
+		 * RelOptInfo的baserestrictinfo成员都指向同一个值，
 		 * 表示RelOptInfo上非连接的约束条件。
 		 */
 		foreach (rcell, index->indrestrictinfo)
@@ -721,7 +702,7 @@ find_structured_index_paths(PlannerInfo *root,
 			continue;
 		
 		index_path = create_structured_index_path(root, baserel, index, &clauseset);
-		lappend(index_paths, index_path);
+		index_paths = lappend(index_paths, index_path);
 	}
 
 	return index_paths;
@@ -1143,7 +1124,7 @@ find_anns_index_paths(PlannerInfo *root,
 
 	/* skip if no indexes */
 	if (baserel->indexlist == NIL)
-		return NULL;
+		return NIL;
 
 	foreach (icell, baserel->indexlist)
 	{
@@ -1166,75 +1147,143 @@ find_anns_index_paths(PlannerInfo *root,
 		hybridquery_match_pathkeys_to_index(index, root->query_pathkeys,
 								&orderbyclauses,
 								&orderbyclausecols);
-		if (orderbyclauses != NIL && \
-			orderbyclausecols != NIL)
+		if (orderbyclauses == NIL || \
+			orderbyclausecols == NIL)
 			continue;
 		
-		index_path = create_anns_index_path(root, baserel, index, orderbyclauses, orderbyclausecols);
-		lappend(index_paths, index_path);
+		index_path = create_anns_index_path(root, index, orderbyclauses, orderbyclausecols);
+		index_paths = lappend(index_paths, index_path);
 	}
 
 	return index_paths;
 }
 
+// static void
+// estimate_cost_for_ivfpq(IndexPath *best_structured_index_path, IndexPath *best_anns_index_path,
+// 						Cost *hybrid_cost, Cost *not_hybrid_cost)
+// {
+// 	/* 向量索引+结构化过滤的代价 */
+// 	int32 n = 1000000;
+// 	int32 ni = 64;
+// 	Cost anns_structured_cost;
+// 	Cost structured_anns_cost;
+// 	anns_structured_cost = (128.0 / 512.0) * n * cost_from_distance_tables;
+// 	structured_anns_cost = best_structured_index_path->indextotalcost + best_selectivity * n * cost_from_distance_tables;
+
+// 	/* 结构化+向量索引的代价 */
+// 	Cost anns_structured_anns_io_cost;
+// 	Cost structured_anns_anns_io_cost;
+// 	anns_structured_anns_io_cost = (128.0 / 512.0) * ((float)n / ni) * DEFAULT_SEQ_PAGE_COST;
+// 	structured_anns_anns_io_cost = best_selectivity * n * DEFAULT_RANDOM_PAGE_COST;
+
+// 	anns_structured_cost += anns_structured_anns_io_cost;
+// 	structured_anns_cost += structured_anns_anns_io_cost;
+// }
+
+static Cost
+estimate_hybrid_ivfpq_cost(IndexPath *index_path, Selectivity selectivity)
+{
+	Cost total_cost = 0.0;
+	Cost io_cost;
+	Cost cpu_cost;
+
+	// TODO:
+	int32 n = 1000000;
+	
+	io_cost = selectivity * n * DEFAULT_RANDOM_PAGE_COST;
+	cpu_cost = selectivity * n * cost_from_distance_tables;
+
+	total_cost += io_cost + cpu_cost;
+
+	return total_cost;
+}
+
 static bool
 find_best_paths(List *structured_index_paths, List *anns_index_paths,
-				List **p_best_structured_index_path, List **p_best_anns_index_path)
+				IndexPath **p_best_structured_index_path, IndexPath **p_best_anns_index_path)
 {
 	bool		 use_hybridquery = false;
-	IndexPath	*best_structured_index_path = NIL;
-	IndexPath	*best_anns_index_path = NIL;
+	IndexPath	*best_structured_index_path = NULL;
+	IndexPath	*best_anns_index_path = NULL;
 	ListCell	*lc;
+
+	Cost hybrid_cost;
+	Cost not_hybrid_cost;
+
+	Selectivity min_selectivity = 1.0;
+	Cost		min_anns_cost = DBL_MAX;
 
 	/* 
 	 * NOTE:
 	 * 这里只关注选择率，因为要通过结构化索引的结果去优化向量索引的搜索，
 	 * 结构化索引的选择率越低，向量索引的搜索越快。
 	 */
-	Selectivity best_selectivity = 1.0;
 	foreach (lc, structured_index_paths)
 	{
 		IndexPath *index_path = (IndexPath *)lfirst(lc);
-		if (best_selectivity > index_path->indexselectivity)
+		if (min_selectivity > index_path->indexselectivity)
 		{
-			best_selectivity = index_path->indexselectivity;
+			min_selectivity = index_path->indexselectivity;
 			best_structured_index_path = index_path;
 		}
 	}
 
-	Cost best_anns_cost = DBL_MAX;
+	/* 
+	 * NOTE:
+	 * 最优的结构化索引的选择规则为选择率最低，但是最优的向量索引的选择规则
+	 * 需要根据结构化索引的选择率来判断，比如pg_ivfpq索引的搜索能够通过结构化索引
+	 * 进行加速，但是pg_hnsw索引的搜索很难通过结构化索引进行加速。
+	 */
+	
 	foreach (lc, anns_index_paths)
 	{
 		IndexPath *index_path = (IndexPath *)lfirst(lc);
-		if (best_anns_cost > index_path->indextotalcost)
+		Name amname = GetIndexAmNameByAmOid(index_path->indexinfo->relam, false);
+		Cost anns_cost;
+		if (strcmp("pg_ivfpq", amname->data) == 0)
 		{
-			best_anns_cost = index_path->indextotalcost;
+			anns_cost = estimate_hybrid_ivfpq_cost(index_path, min_selectivity);
+		}
+		else
+		{
+			// TODO:
+		}
+
+		if (min_anns_cost > anns_cost)
+		{
+			min_anns_cost = anns_cost;
 			best_anns_index_path = index_path;
 		}
 	}
 
+	hybrid_cost = best_structured_index_path->indextotalcost + min_anns_cost;
+	/* 
+	 * TODO:
+	 * 得到非联合查询的代价：直接使用向量索引的代价作为非联合查询的代价，
+	 * 现在向量索引的amcostestimate函数还未实现，暂时在此处进行估计。
+	 * 事实上，这里不需要计算非联合查询的代价，只需要计算联合查询的代价，
+	 * 然后更新联合查询下向量索引的代价即可，PostgreSQL的查询规划模块会
+	 * 自动选择代价最低的路径。
+	 */
 	int32 n = 1000000;
 	int32 ni = 64;
-	Cost anns_structured_cost;
-	Cost structured_anns_cost;
-	anns_structured_cost = (128.0 / 512.0) * n * cost_from_distance_tables;
-	structured_anns_cost = best_structured_index_path->indextotalcost + best_selectivity * n * cost_from_distance_tables;
-
-	Cost anns_structured_anns_io_cost;
-	Cost structured_anns_anns_io_cost;
-	anns_structured_anns_io_cost = (128.0 / 512.0) * ((float)n / ni) * DEFAULT_SEQ_PAGE_COST;
-	structured_anns_anns_io_cost = best_selectivity * n * DEFAULT_RANDOM_PAGE_COST;
-
-	anns_structured_cost += anns_structured_anns_io_cost;
-	structured_anns_cost += structured_anns_anns_io_cost;
-
-	if (anns_structured_cost > structured_anns_cost)
-	{
+	not_hybrid_cost = (128.0 / 512.0) * n * cost_from_distance_tables /* cpu cost */ + \
+					  (128.0 / 512.0) * ((float)n / ni) * DEFAULT_SEQ_PAGE_COST /* io cost */;
+	
+	if (hybrid_cost < not_hybrid_cost)
 		use_hybridquery = true;
-		// TODO: 更新结构化索引和向量索引的cost
-		*p_best_structured_index_path = best_structured_index_path;
-		*p_best_anns_index_path = best_anns_index_path;
-	}
+	
+	/* 更新联合查询下向量索引的代价 */
+	// best_anns_index_path->indextotalcost = min_anns_cost;
+	best_anns_index_path->indextotalcost = 0.0;
+
+	/* 
+	 * NOTE:
+	 * 只要满足联合查询的条件，就会提供联合查询的查询路径，
+	 * 是否使用联合查询，PostgreSQL会自动进行选择。
+	 */
+	*p_best_structured_index_path = best_structured_index_path;
+	*p_best_anns_index_path = best_anns_index_path;
 
 	return use_hybridquery;
 }
@@ -1250,8 +1299,8 @@ set_hybridquery_path(PlannerInfo *root, RelOptInfo *baserel,
 	List		*structured_index_paths;
 	List		*anns_index_paths;
 	// NOTE: 如果进行联合查询，向量索引肯定是最后执行的。
-	IndexPath	*best_structured_index_path = NIL;
-	IndexPath	*best_anns_index_path = NIL;
+	IndexPath	*best_structured_index_path = NULL;
+	IndexPath	*best_anns_index_path = NULL;
 	bool		 use_hybridquery;
 
 	/* 
@@ -1274,12 +1323,14 @@ set_hybridquery_path(PlannerInfo *root, RelOptInfo *baserel,
 	
 	// 3. 结构化索引
 	structured_index_paths = find_structured_index_paths(root, baserel);
-	if (structured_index_paths->length == 0)
+	if (structured_index_paths == NIL || \
+		structured_index_paths->length == 0)
 		return;
 	
 	// 4. 向量索引
 	anns_index_paths = find_anns_index_paths(root, baserel);
-	if (anns_index_paths->length == 0)
+	if (anns_index_paths == NIL || \
+		anns_index_paths->length == 0)
 		return;
 	
 	// 5. 联合查询的代价比非联合查询的代价低
@@ -1287,7 +1338,7 @@ set_hybridquery_path(PlannerInfo *root, RelOptInfo *baserel,
 									  &best_structured_index_path, &best_anns_index_path);
 	// 是否进行联合查询，不使用联合查询则直接返回，此时会使用PostgreSQL规划的路径。
 	if (!use_hybridquery)
-		return;
+		elog(INFO, "Cost of hybrid query is greater than cost of ANNS + Filter");
 
 	// 填充CustomPath数据结构，并将best_structured_path和best_anns_path放到CustomPath中。
 	cpath = makeNode(CustomPath);
@@ -1306,14 +1357,18 @@ set_hybridquery_path(PlannerInfo *root, RelOptInfo *baserel,
 
 	// TODO: 待确认startup_cost和total_cost这样设置是否正确
 	cpath->path.rows = 512;  // TODO: be fixed to 512 now and to be fixed later.
-	cpath->path.startup_cost = best_structured_index_path->indextotalcost;
-	cpath->path.total_cost = best_anns_index_path->indextotalcost;
+	// cpath->path.startup_cost = best_structured_index_path->indextotalcost;
+	// cpath->path.total_cost = best_anns_index_path->indextotalcost;
+	cpath->path.startup_cost = 0.0;
+	cpath->path.total_cost = 0.0;
 
 	cpath->path.pathkeys = root->query_pathkeys;
 
 	cpath->flags = 0;
-	cpath->custom_paths = list_make2(best_structured_index_path, best_anns_index_path);
-	cpath->custom_private = NULL;
+	cpath->custom_paths = NIL;  // 内部会遍历这个列表，然后根据查询路径生成对应的查询计划，
+								// 然后传给PlanCustomPath变量，此处希望全部执行过程都由本扩展掌控，
+								// 因此把结构化索引和向量索引生成的查询路径放到custom_private中。
+	cpath->custom_private = list_make2(best_structured_index_path, best_anns_index_path);
 	cpath->methods = &hybridquery_path_methods;
 
 	// 将CustomPath（即联合查询的最优路径）添加到baserel的pathlist中。
@@ -1786,11 +1841,141 @@ copy_generic_path_info(Plan *dest, Path *src)
 }
 
 static Scan *
-hybridquery_create_indexscan_plan(PlannerInfo *root,
+create_structured_is_plan(PlannerInfo *root,
+					  IndexPath *best_path,
+					  List *tlist)
+{
+	Scan	   *scan_plan;
+	List	   *indexquals = best_path->indexquals;
+	Index		baserelid = best_path->path.parent->relid;
+	Oid			indexoid = best_path->indexinfo->indexoid;
+	List	   *qpqual;
+	List	   *stripped_indexquals;
+	List	   *fixed_indexquals;
+	ListCell   *l;
+
+	/* scan_clauses直接使用索引路径的IndexOptInfo->indrestrictinfo变量加上参数化条件 */
+	List *scan_clauses = best_path->indexinfo->indrestrictinfo;
+	if (best_path->path.param_info)
+		scan_clauses = list_concat(list_copy(scan_clauses),
+								   best_path->path.param_info->ppi_clauses);
+
+	/* it should be a base rel... */
+	Assert(baserelid > 0);
+	Assert(best_path->path.parent->rtekind == RTE_RELATION);
+
+	/*
+	 * Build "stripped" indexquals structure (no RestrictInfos) to pass to
+	 * executor as indexqualorig
+	 */
+	stripped_indexquals = get_actual_clauses(indexquals);
+
+	/*
+	 * The executor needs a copy with the indexkey on the left of each clause
+	 * and with index Vars substituted for table ones.
+	 */
+	fixed_indexquals = fix_indexqual_references(root, best_path);
+
+	/*
+	 * The qpqual list must contain all restrictions not automatically handled
+	 * by the index, other than pseudoconstant clauses which will be handled
+	 * by a separate gating plan node.  All the predicates in the indexquals
+	 * will be checked (either by the index itself, or by nodeIndexscan.c),
+	 * but if there are any "special" operators involved then they must be
+	 * included in qpqual.  The upshot is that qpqual must contain
+	 * scan_clauses minus whatever appears in indexquals.
+	 *
+	 * In normal cases simple pointer equality checks will be enough to spot
+	 * duplicate RestrictInfos, so we try that first.
+	 *
+	 * Another common case is that a scan_clauses entry is generated from the
+	 * same EquivalenceClass as some indexqual, and is therefore redundant
+	 * with it, though not equal.  (This happens when indxpath.c prefers a
+	 * different derived equality than what generate_join_implied_equalities
+	 * picked for a parameterized scan's ppi_clauses.)
+	 *
+	 * In some situations (particularly with OR'd index conditions) we may
+	 * have scan_clauses that are not equal to, but are logically implied by,
+	 * the index quals; so we also try a predicate_implied_by() check to see
+	 * if we can discard quals that way.  (predicate_implied_by assumes its
+	 * first input contains only immutable functions, so we have to check
+	 * that.)
+	 *
+	 * Note: if you change this bit of code you should also look at
+	 * extract_nonindex_conditions() in costsize.c.
+	 */
+	qpqual = NIL;
+	foreach(l, scan_clauses)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, l);
+
+		if (rinfo->pseudoconstant)
+			continue;			/* we may drop pseudoconstants here */
+		if (list_member_ptr(indexquals, rinfo))
+			continue;			/* simple duplicate */
+		if (is_redundant_derived_clause(rinfo, indexquals))
+			continue;			/* derived from same EquivalenceClass */
+		if (!contain_mutable_functions((Node *) rinfo->clause) &&
+			predicate_implied_by(list_make1(rinfo->clause), indexquals, false))
+			continue;			/* provably implied by indexquals */
+		qpqual = lappend(qpqual, rinfo);
+	}
+
+	/* Sort clauses into best execution order */
+	qpqual = order_qual_clauses(root, qpqual);
+
+	/* Reduce RestrictInfo list to bare expressions; ignore pseudoconstants */
+	qpqual = extract_actual_clauses(qpqual, false);
+
+	/*
+	 * We have to replace any outer-relation variables with nestloop params in
+	 * the indexqualorig, qpqual, and indexorderbyorig expressions.  A bit
+	 * annoying to have to do this separately from the processing in
+	 * fix_indexqual_references --- rethink this when generalizing the inner
+	 * indexscan support.  But note we can't really do this earlier because
+	 * it'd break the comparisons to predicates above ... (or would it?  Those
+	 * wouldn't have outer refs)
+	 */
+	if (best_path->path.param_info)
+	{
+		stripped_indexquals = (List *)
+			replace_nestloop_params(root, (Node *) stripped_indexquals);
+		qpqual = (List *)
+			replace_nestloop_params(root, (Node *) qpqual);
+	}
+
+	/* 对于联合查询中的结构化索引，因为是创建IndexOnlyScan，因此不需要得到对应的索引列，
+	 * 只需要得到ItemPoinerData，因此tlist直接设置为空。
+	 */
+	scan_plan = (Scan *) make_indexscan(tlist,
+										qpqual,
+										baserelid,
+										indexoid,
+										fixed_indexquals,
+										stripped_indexquals,
+										NIL,
+										NIL,
+										NIL,
+										best_path->indexscandir);
+	// scan_plan = (Scan *) make_indexscan(NIL,
+	// 										qpqual,
+	// 										baserelid,
+	// 										indexoid,
+	// 										fixed_indexquals,
+	// 										NIL,
+	// 										best_path->indexinfo->indextlist,
+	// 										best_path->indexscandir);
+
+	copy_generic_path_info(&scan_plan->plan, &best_path->path);
+
+	return scan_plan;
+}
+
+static Scan *
+create_anns_is_plan(PlannerInfo *root,
 					  IndexPath *best_path,
 					  List *tlist,
-					  List *scan_clauses,
-					  bool indexonly)
+					  List *scan_clauses)
 {
 	Scan	   *scan_plan;
 	List	   *indexquals = best_path->indexquals;
@@ -1930,45 +2115,55 @@ hybridquery_create_indexscan_plan(PlannerInfo *root,
 	}
 
 	/* Finally ready to build the plan node */
-	if (indexonly)
-		scan_plan = (Scan *) make_indexonlyscan(tlist,
-												qpqual,
-												baserelid,
-												indexoid,
-												fixed_indexquals,
-												fixed_indexorderbys,
-												best_path->indexinfo->indextlist,
-												best_path->indexscandir);
-	else
-		scan_plan = (Scan *) make_indexscan(tlist,
-											qpqual,
-											baserelid,
-											indexoid,
-											fixed_indexquals,
-											stripped_indexquals,
-											fixed_indexorderbys,
-											indexorderbys,
-											indexorderbyops,
-											best_path->indexscandir);
+	scan_plan = (Scan *) make_indexscan(tlist,
+										qpqual,
+										baserelid,
+										indexoid,
+										fixed_indexquals,
+										stripped_indexquals,
+										fixed_indexorderbys,
+										indexorderbys,
+										indexorderbyops,
+										best_path->indexscandir);
 
 	copy_generic_path_info(&scan_plan->plan, &best_path->path);
 
 	return scan_plan;
 }
 
-/*
-typedef struct IndexScan
+static CustomScan *
+create_customscan_plan(IndexScan *structured_is, IndexScan *anns_is)
 {
-	Scan		scan;
-	Oid			indexid;		
-	List	   *indexqual;		
-	List	   *indexqualorig;	
-	List	   *indexorderby;	
-	List	   *indexorderbyorig;
-	List	   *indexorderbyops;
-	ScanDirection indexorderdir;
-} IndexScan;
-*/
+	CustomScan	*cscan = makeNode(CustomScan);
+
+	cscan->scan.plan.startup_cost = structured_is->scan.plan.total_cost + anns_is->scan.plan.startup_cost;
+	cscan->scan.plan.total_cost = structured_is->scan.plan.total_cost + anns_is->scan.plan.total_cost;
+	cscan->scan.plan.plan_rows = anns_is->scan.plan.plan_rows;
+	cscan->scan.plan.plan_width = anns_is->scan.plan.plan_width;
+	cscan->scan.plan.parallel_aware = false;
+	cscan->scan.plan.parallel_safe = false;
+	cscan->scan.plan.plan_node_id = anns_is->scan.plan.plan_node_id;  // TODO:
+	cscan->scan.plan.targetlist = anns_is->scan.plan.targetlist;
+	cscan->scan.plan.qual = anns_is->scan.plan.qual;
+	cscan->scan.plan.lefttree = (Plan *)structured_is;
+	cscan->scan.plan.righttree = (Plan *)anns_is;
+	cscan->scan.plan.initPlan = NIL;
+	cscan->scan.plan.extParam = NULL;
+	cscan->scan.plan.allParam = NULL;
+
+	cscan->scan.scanrelid = anns_is->scan.scanrelid;  // TODO: 直接使用PlanCustomPath函数的RelOptInfo参数中的relid进行初始化
+
+	cscan->flags = 0;
+	cscan->custom_plans = NIL;  // 同CustomPath
+	cscan->custom_exprs = NIL;
+	cscan->custom_private = NIL;
+	cscan->custom_scan_tlist = NIL;
+	cscan->custom_relids = NULL;
+	cscan->methods = &hybridquery_scan_methods;
+
+	return cscan;
+}
+
 /*
  * PlanHybridQueryPath
  */
@@ -1980,30 +2175,35 @@ PlanHybridQueryPath(PlannerInfo *root,
 				 List *clauses,
 				 List *custom_plans)
 {
-	CustomScan	*cscan = makeNode(CustomScan);
+	CustomScan	*cscan;
 	IndexPath	*structured_ipath;
 	IndexPath	*anns_ipath;
-	IndexScan	*structured_indexscan;
-	IndexScan	*anns_indexscan;
+	IndexScan	*structured_is;
+	IndexScan	*anns_is;
 
-	structured_ipath = (IndexPath *) lfirst(list_head(best_path->custom_paths));
+	structured_ipath = (IndexPath *) lfirst(list_head(best_path->custom_private));
 	anns_ipath = (IndexPath *) lfirst(list_tail(best_path->custom_private));
 
-	
-	structured_indexscan = (IndexScan *)hybridquery_create_indexscan_plan(root, structured_ipath, tlist, clauses, false);
+	/* 
+	 * 结构化索引对应的查询计划
+	 */
+	structured_is = (IndexScan *)create_structured_is_plan(root, structured_ipath, tlist);
 
-	// 1. 以createplan.c中create_indexscan_plan函数的方式，调用make_indexscan创建Scan对象（实际上是Plan的子类），
-	// make_indexscan函数需要的参数存放在CustomPath中，而CustomPath会在create_hybridquery_path被填充。
-	
-	anns_indexscan = (IndexScan *)hybridquery_create_indexscan_plan(root, anns_ipath, tlist, clauses, false);
+	/* 
+	 * 向量索引对应的查询计划
+	 * NOTE:
+	 * 现阶段，向量索引对应的查询计划是自定义查询计划的实际执行者，只是在执行向量索引之前，
+	 * 自定义查询计划会先执行结构化索引对应的查询计划，再将其输出传给向量索引对应的查询计划，此后，
+	 * 自定义查询计划的实际工作者就变成了向量索引对应的查询计划，完成查询，投影，条件过滤，排序等功能。
+	 */
+	anns_is = (IndexScan *)create_anns_is_plan(root, anns_ipath, tlist, clauses);
 
-	// 2. 填充CustomScan
-	cscan->scan = anns_indexscan->scan;  // TODO: 基类的成员该使用什么值进行初始化？暂时使用的向量索引对应的IndexScan的基类进行初始化的
-	NodeSetTag(cscan, T_CustomScan);
-	cscan->flags = best_path->flags;
-	cscan->custom_plans = list_make1(structured_indexscan);  // 保存结构化索引的IndexScan到CustomScan
-	cscan->custom_private = list_make1(anns_indexscan);  // 保存IndexScan到CustomScan
-	cscan->methods = &hybridquery_scan_methods;
+	/* 
+	 * 填充CustomScan
+	 * NOTE:
+	 * CustomScan->scan.plan中的大部分内容从向量索引对应的查询计划得到。
+	 */
+	cscan = create_customscan_plan(structured_is, anns_is);
 
 	return &cscan->scan.plan;  // 其实就是返回CustomScan的指针，只是为了达到类似C++的多态效果
 }
@@ -2018,84 +2218,34 @@ CreateHybridQueryScanState(CustomScan *custom_plan)
 
 	NodeSetTag(hqs, T_CustomScanState);
 	hqs->css.flags = custom_plan->flags;
+	hqs->css.custom_ps = NIL;
+	hqs->css.pscan_len = 0;
 	hqs->css.methods = &hybridquery_exec_methods;
-
-	hqs->quals_is = (IndexScan *) lfirst(list_head(custom_plan->custom_plans));
-	hqs->anns_is = (IndexScan *) lfirst(list_head(custom_plan->custom_private));
 
 	return (Node *)&hqs->css;
 }
 
-/*
-typedef struct IndexScanState
+static IndexScanState *
+init_structured_iss(IndexScan *node, EState *estate, int eflags)
 {
-	ScanState	ss;				// its first field is NodeTag
-	ExprState  *indexqualorig;
-	List	   *indexorderbyorig;
-	ScanKey		iss_ScanKeys;
-	int			iss_NumScanKeys;
-	ScanKey		iss_OrderByKeys;
-	int			iss_NumOrderByKeys;
-	IndexRuntimeKeyInfo *iss_RuntimeKeys;
-	int			iss_NumRuntimeKeys;
-	bool		iss_RuntimeKeysReady;
-	ExprContext *iss_RuntimeContext;
-	Relation	iss_RelationDesc;
-	IndexScanDesc iss_ScanDesc;
+	IndexScanState *result;
+	result = (IndexScanState *) ExecInitNode(&(node->scan.plan), estate, eflags);
+	return result;
+}
 
-	// These are needed for re-checking ORDER BY expr ordering
-	pairingheap *iss_ReorderQueue;
-	bool		iss_ReachedEnd;
-	Datum	   *iss_OrderByValues;
-	bool	   *iss_OrderByNulls;
-	SortSupport iss_SortSupport;
-	bool	   *iss_OrderByTypByVals;
-	int16	   *iss_OrderByTypLens;
-	Size		iss_PscanLen;
-} IndexScanState;
-*/
-typedef struct HybridQueryIndexScanState
+static IndexScanState *
+init_anns_iss(IndexScan *node, EState *estate, int eflags)
 {
-	ExprState  *indexqualorig;
-	List	   *indexorderbyorig;
-	ScanKey		iss_ScanKeys;
-	int			iss_NumScanKeys;
-	ScanKey		iss_OrderByKeys;
-	int			iss_NumOrderByKeys;
-	IndexRuntimeKeyInfo *iss_RuntimeKeys;
-	int			iss_NumRuntimeKeys;
-	bool		iss_RuntimeKeysReady;
-	ExprContext *iss_RuntimeContext;
-	Relation	iss_RelationDesc;
-	IndexScanDesc iss_ScanDesc;
+	IndexScanState *result;
+	result = (IndexScanState *) ExecInitNode(&(node->scan.plan), estate, eflags);
+	return result;
 
-	pairingheap *iss_ReorderQueue;
-	bool		iss_ReachedEnd;
-	Datum	   *iss_OrderByValues;
-	bool	   *iss_OrderByNulls;
-	SortSupport iss_SortSupport;
-	bool	   *iss_OrderByTypByVals;
-	int16	   *iss_OrderByTypLens;
-	Size		iss_PscanLen;	
-} HybridQueryIndexScanState;
-
-/*
- * BeginHybridQueryScan
- */
-static void
-BeginHybridQueryScan(CustomScanState *css, EState *estate, int eflags)
-{
-	HybridQueryState  *hqs = (HybridQueryState *)css;
-
-	hqs->quals_iss = (IndexScanState *) ExecInitNode(&(hqs->quals_is->scan.plan), estate, eflags);
-	
-	// 完成所提供的CustomScanState的初始化。标准的域已经被ExecInitCustomScan初始化，但是任何私有的域应该在这里被初始化。
-	// 完成HybridQueryState中除CustomScanState的其他成员的初始化
-	HybridQueryIndexScanState *indexstate = (HybridQueryIndexScanState *)((char *)hqs + offsetof(HybridQueryState, anns_iss));
-	IndexScan *node = hqs->anns_is;  // IndexScan
-
+	/*
+	IndexScanState *indexstate;
 	Relation	currentRelation;
 	bool		relistarget;
+
+	indexstate = makeNode(IndexScanState);
 
 	indexstate->indexqualorig =
 		ExecInitQual(node->indexqualorig, (PlanState *) hqs);
@@ -2109,16 +2259,10 @@ BeginHybridQueryScan(CustomScanState *css, EState *estate, int eflags)
 	indexstate->iss_RelationDesc = index_open(node->indexid,
 											  relistarget ? NoLock : AccessShareLock);
 
-	/*
-	 * Initialize index-specific scan state
-	 */
 	indexstate->iss_RuntimeKeysReady = false;
 	indexstate->iss_RuntimeKeys = NULL;
 	indexstate->iss_NumRuntimeKeys = 0;
 
-	/*
-	 * build the index scan keys from the index qualification
-	 */
 	ExecIndexBuildScanKeys((PlanState *) hqs,
 						   indexstate->iss_RelationDesc,
 						   node->indexqual,
@@ -2127,12 +2271,9 @@ BeginHybridQueryScan(CustomScanState *css, EState *estate, int eflags)
 						   &indexstate->iss_NumScanKeys,
 						   &indexstate->iss_RuntimeKeys,
 						   &indexstate->iss_NumRuntimeKeys,
-						   NULL,	/* no ArrayKeys */
+						   NULL,
 						   NULL);
 
-	/*
-	 * any ORDER BY exprs have to be turned into scankeys in the same way
-	 */
 	ExecIndexBuildScanKeys((PlanState *) hqs,
 						   indexstate->iss_RelationDesc,
 						   node->indexorderby,
@@ -2141,10 +2282,9 @@ BeginHybridQueryScan(CustomScanState *css, EState *estate, int eflags)
 						   &indexstate->iss_NumOrderByKeys,
 						   &indexstate->iss_RuntimeKeys,
 						   &indexstate->iss_NumRuntimeKeys,
-						   NULL,	/* no ArrayKeys */
+						   NULL,
 						   NULL);
 
-	/* Initialize sort support, if we need to re-check ORDER BY exprs */
 	if (indexstate->iss_NumOrderByKeys > 0)
 	{
 		int			numOrderByKeys = indexstate->iss_NumOrderByKeys;
@@ -2152,10 +2292,6 @@ BeginHybridQueryScan(CustomScanState *css, EState *estate, int eflags)
 		ListCell   *lco;
 		ListCell   *lcx;
 
-		/*
-		 * Prepare sort support, and look up the data type for each ORDER BY
-		 * expression.
-		 */
 		Assert(numOrderByKeys == list_length(node->indexorderbyops));
 		Assert(numOrderByKeys == list_length(node->indexorderbyorig));
 		indexstate->iss_SortSupport = (SortSupportData *)
@@ -2173,14 +2309,13 @@ BeginHybridQueryScan(CustomScanState *css, EState *estate, int eflags)
 			Oid			orderbyColl = exprCollation(orderbyexpr);
 			SortSupport orderbysort = &indexstate->iss_SortSupport[i];
 
-			/* Initialize sort support */
 			orderbysort->ssup_cxt = CurrentMemoryContext;
 			orderbysort->ssup_collation = orderbyColl;
-			/* See cmp_orderbyvals() comments on NULLS LAST */
+			
 			orderbysort->ssup_nulls_first = false;
-			/* ssup_attno is unused here and elsewhere */
+			
 			orderbysort->ssup_attno = 0;
-			/* No abbreviation */
+			
 			orderbysort->abbreviate = false;
 			PrepareSortSupportFromOrderingOp(orderbyop, orderbysort);
 
@@ -2190,13 +2325,13 @@ BeginHybridQueryScan(CustomScanState *css, EState *estate, int eflags)
 			i++;
 		}
 
-		/* allocate arrays to hold the re-calculated distances */
+		
 		indexstate->iss_OrderByValues = (Datum *)
 			palloc(numOrderByKeys * sizeof(Datum));
 		indexstate->iss_OrderByNulls = (bool *)
 			palloc(numOrderByKeys * sizeof(bool));
 
-		/* and initialize the reorder queue */
+		
 		// TODO: 现在暂时不用这个
 		indexstate->iss_ReorderQueue = NULL;
 	}
@@ -2214,6 +2349,36 @@ BeginHybridQueryScan(CustomScanState *css, EState *estate, int eflags)
 		indexstate->iss_RuntimeContext = NULL;
 	}
 
+	return NULL;
+	*/
+}
+
+/*
+ * BeginHybridQueryScan
+ */
+static void
+BeginHybridQueryScan(CustomScanState *css, EState *estate, int eflags)
+{
+	HybridQueryState	*hqs = (HybridQueryState *)css;
+	IndexScanState		*structured_iss;
+	IndexScanState		*anns_iss;
+
+	structured_iss = init_structured_iss((IndexScan *)hqs->css.ss.ps.plan->lefttree,
+										   estate, eflags);
+	anns_iss = init_anns_iss((IndexScan *)hqs->css.ss.ps.plan->righttree,
+							  estate, eflags);
+	
+	hqs->css.ss.ps.lefttree = (PlanState *)structured_iss;
+	hqs->css.ss.ps.righttree = (PlanState *)anns_iss;
+
+	hqs->css.ss.ss_currentScanDesc = NULL;  /* no heap scan here */
+
+	/* 
+	 * NOTE:
+	 * CustomScanState的其余成员在ExecInitCustomScan中被初始化。
+	 * 注意CreateCustomScanState和BeginHybridQueryScan这两个成员函数需要完成的功能。
+	 */
+	
 	return;
 }
 
@@ -2233,8 +2398,12 @@ typedef PGIVFPQScanOpaqueData * PGIVFPQScanOpaque;
 static TupleTableSlot *
 HybridQueryAccess(CustomScanState *css)
 {
-	HybridQueryState  *hqs = (HybridQueryState *)css;
-	HybridQueryIndexScanState *node = (HybridQueryIndexScanState *)((char *)hqs + offsetof(HybridQueryState, anns_iss));
+	HybridQueryState	*hqs = (HybridQueryState *)css;
+	PlanState			*outerNode;
+	PlanState			*innerNode;
+	
+	outerNode = outerPlanState(hqs);
+	innerNode = innerPlanState(hqs);
 
 	EState	   *estate;
 	ExprContext *econtext;
@@ -2243,18 +2412,12 @@ HybridQueryAccess(CustomScanState *css)
 	HeapTuple	tuple;
 	TupleTableSlot *slot;
 
-	TupleTableSlot *quals_slot;
-	int quals_cnt = 0;
-
-	// TODO:
-	hqs->quals_iss->ss.ps.ps_ProjInfo = NULL;
-
-	std::vector<ItemPointerData> ipd_vec;
+	IndexScanState *node = (IndexScanState *)innerNode;
 
 	/*
 	 * extract necessary information from index scan node
 	 */
-	estate = hqs->css.ss.ps.state;
+	estate = node->ss.ps.state;
 	direction = estate->es_direction;
 	// /* flip direction if this is an overall backward scan */
 	// if (ScanDirectionIsBackward(((IndexScan *) node->ss.ps.plan)->indexorderdir))
@@ -2266,8 +2429,8 @@ HybridQueryAccess(CustomScanState *css)
 	// }
 	direction = NoMovementScanDirection;
 	scandesc = node->iss_ScanDesc;
-	econtext = hqs->css.ss.ps.ps_ExprContext;
-	slot = hqs->css.ss.ss_ScanTupleSlot;
+	econtext = node->ss.ps.ps_ExprContext;
+	slot = node->ss.ss_ScanTupleSlot;
 
 	if (scandesc == NULL)
 	{
@@ -2275,7 +2438,7 @@ HybridQueryAccess(CustomScanState *css)
 		 * We reach here if the index scan is not parallel, or if we're
 		 * serially executing an index scan that was planned to be parallel.
 		 */
-		scandesc = index_beginscan(hqs->css.ss.ss_currentRelation,
+		scandesc = index_beginscan(node->ss.ss_currentRelation,
 								   node->iss_RelationDesc,
 								   estate->es_snapshot,
 								   node->iss_NumScanKeys,
@@ -2293,39 +2456,44 @@ HybridQueryAccess(CustomScanState *css)
 						 node->iss_OrderByKeys, node->iss_NumOrderByKeys);
 	}
 
-	// 获取结构化条件的结果
+	/* 结构化索引扫描 */
 	// TODO: 把结构化条件的结果存放在opaque中，但是需要抽象出来作为基类，这样就不依赖某种特定的向量索引了，但所有向量索引的opaque都需要继承这个基类
+	std::vector<ItemPointerData> ipd_vec;
+	TupleTableSlot	*structured_slot;
+	int				structured_cnt = 0;
 	PGIVFPQScanOpaque so = (PGIVFPQScanOpaque)scandesc->opaque;
 	if (so->first_call)
 	{
 		for (;;)
 		{
-			quals_slot = ExecProcNode(&(hqs->quals_iss->ss.ps));
-			if (TupIsNull(quals_slot))
+			elog(WARNING, "structured_cnt: %d", structured_cnt);
+			structured_slot = ExecProcNode(outerNode);
+			if (TupIsNull(structured_slot))
 			{
 				break;
 			}
 			else
 			{
-				ipd_vec.push_back(quals_slot->tts_tuple->t_self);
-				quals_cnt++;
+				ipd_vec.push_back(structured_slot->tts_tuple->t_self);
+				structured_cnt++;
 			}
 		}
-		elog(WARNING, "quals_cnt: %d", quals_cnt);
+		elog(WARNING, "structured_cnt: %d", structured_cnt);
 
 		MemoryContext old_ctx;
 
 		old_ctx = MemoryContextSwitchTo(so->scan_ctx);
-		ItemPointerData *quals_ipds = (ItemPointerData *) palloc0(sizeof(ItemPointerData) * quals_cnt);
-		for (int i = 0; i < quals_cnt; i++)
+		ItemPointerData *quals_ipds = (ItemPointerData *) palloc0(sizeof(ItemPointerData) * structured_cnt);
+		for (int i = 0; i < structured_cnt; i++)
 			quals_ipds[i] = ipd_vec[i];
 		
 		so->quals_ipds = quals_ipds;
-		so->quals_ipds_cnt = quals_cnt;
+		so->quals_ipds_cnt = structured_cnt;
 
 		MemoryContextSwitchTo(old_ctx);
 	}
-
+	
+	/* 向量索引扫描 */
 	/*
 	 * ok, now that we have what we need, fetch the next tuple.
 	 */
@@ -2360,6 +2528,8 @@ HybridQueryAccess(CustomScanState *css)
 
 		return slot;
 	}
+
+	/* 条件过滤和投影操作在ExecScan中进行 */
 
 	/*
 	 * if we get here it means the index scan failed so we are at the end of
@@ -2402,27 +2572,17 @@ EndHybridQueryScan(CustomScanState *node)
 {
 	HybridQueryState *hqs = (HybridQueryState *)node;
 
-	// 对比nodeCustom.c的ExecEndCustomScan函数和nodeIndexscan.c的ExecEndIndexScan函数，按照后者的处理方式，完成本函数。
-	Relation	indexRelationDesc;
-	IndexScanDesc indexScanDesc;
-	Relation	relation;
+	PlanState			*outerNode;
+	PlanState			*innerNode;
+	
+	outerNode = outerPlanState(hqs);
+	innerNode = innerPlanState(hqs);
 
-	/*
-	 * extract information from the node
-	 */
-	indexRelationDesc = hqs->iss_RelationDesc;
-	indexScanDesc = hqs->iss_ScanDesc;
-	relation = hqs->css.ss.ss_currentRelation;
+	if (hqs->css.ss.ss_currentScanDesc)
+		heap_endscan(hqs->css.ss.ss_currentScanDesc);
 
-	/*
-	 * close the index relation (no-op if we didn't open it)
-	 */
-	if (indexScanDesc)
-		index_endscan(indexScanDesc);
-	// if (indexRelationDesc)
-	// 	index_close(indexRelationDesc, NoLock);
-
-	ExecEndNode(&(hqs->quals_iss->ss.ps));
+	ExecEndNode(outerNode);
+	ExecEndNode(innerNode);
 }
 
 /*
@@ -2432,32 +2592,42 @@ static void
 ReScanHybridQueryScan(CustomScanState *node)
 {
 	HybridQueryState *hqs = (HybridQueryState *)node;
-	// 对比nodeCustom.c的ExecReScanCustomScan函数和nodeIndexscan.c的ExecReScanIndexScan函数，按照后者的处理方式，完成本函数。
-	if (hqs->iss_NumRuntimeKeys != 0)
-	{
-		ExprContext *econtext = hqs->iss_RuntimeContext;
 
-		ResetExprContext(econtext);
-		ExecIndexEvalRuntimeKeys(econtext,
-								 hqs->iss_RuntimeKeys,
-								 hqs->iss_NumRuntimeKeys);
-	}
-	hqs->iss_RuntimeKeysReady = true;
+	PlanState			*outerNode;
+	PlanState			*innerNode;
+	
+	outerNode = outerPlanState(hqs);
+	innerNode = innerPlanState(hqs);
 
-	/* flush the reorder queue */
-	if (hqs->iss_ReorderQueue)
-	{
-		// TODO: 现在暂时不用这个
-	}
+	// // 对比nodeCustom.c的ExecReScanCustomScan函数和nodeIndexscan.c的ExecReScanIndexScan函数，按照后者的处理方式，完成本函数。
+	// if (hqs->iss_NumRuntimeKeys != 0)
+	// {
+	// 	ExprContext *econtext = hqs->iss_RuntimeContext;
 
-	/* reset index scan */
-	if (hqs->iss_ScanDesc)
-		index_rescan(hqs->iss_ScanDesc,
-					 hqs->iss_ScanKeys, hqs->iss_NumScanKeys,
-					 hqs->iss_OrderByKeys, hqs->iss_NumOrderByKeys);
-	hqs->iss_ReachedEnd = false;
+	// 	ResetExprContext(econtext);
+	// 	ExecIndexEvalRuntimeKeys(econtext,
+	// 							 hqs->iss_RuntimeKeys,
+	// 							 hqs->iss_NumRuntimeKeys);
+	// }
+	// hqs->iss_RuntimeKeysReady = true;
 
-	ExecScanReScan(&hqs->css.ss);
+	// /* flush the reorder queue */
+	// if (hqs->iss_ReorderQueue)
+	// {
+	// 	// TODO: 现在暂时不用这个
+	// }
+
+	// /* reset index scan */
+	// if (hqs->iss_ScanDesc)
+	// 	index_rescan(hqs->iss_ScanDesc,
+	// 				 hqs->iss_ScanKeys, hqs->iss_NumScanKeys,
+	// 				 hqs->iss_OrderByKeys, hqs->iss_NumOrderByKeys);
+	// hqs->iss_ReachedEnd = false;
+
+	// ExecScanReScan(&hqs->css.ss);
+
+	ExecScanReScan((ScanState *)outerNode);
+	ExecScanReScan((ScanState *)innerNode);
 }
 
 /*
