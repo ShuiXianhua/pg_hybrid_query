@@ -1,4 +1,5 @@
 #include <vector>
+#include <chrono>
 
 #ifdef __cplusplus
 extern "C"
@@ -47,8 +48,9 @@ extern "C"
 #include "utils/spccache.h"
 #include "utils/selfuncs.h"
 #include "utils/syscache.h"
+#include "utils/datum.h"
 
-#include <float.h>
+#include <math.h>
 
 PG_MODULE_MAGIC;
 
@@ -120,39 +122,6 @@ static CustomExecMethods	hybridquery_exec_methods = {
 	NULL,					/* ShutdownCustomScan */
 	ExplainHybridQueryScan,		/* ExplainCustomScan */
 };
-
-static IndexOptInfo *
-tryfind_anns_index(PlannerInfo *root,
-						  RelOptInfo *baserel)
-{
-	IndexOptInfo   *indexOpt = NULL;
-	ListCell	   *cell;
-
-	/* skip if no indexes */
-	if (baserel->indexlist == NIL)
-		return NULL;
-
-	foreach (cell, baserel->indexlist)
-	{
-		IndexOptInfo   *index = (IndexOptInfo *) lfirst(cell);
-		List		   *temp = NIL;
-		ListCell	   *lc;
-		long			nblocks;
-
-		/* Protect limited-size array in IndexClauseSets */
-		Assert(index->ncolumns <= INDEX_MAX_KEYS);
-
-		// NOTE: baserel->baserestrictinfo中不包含order by语句，需要按照create_hybridquery_path中检查order by语句那样去进行检查
-
-		/* 16386: pg_ivfpq am oid */
-		if (index->relam != 16386)
-			continue;
-
-		indexOpt = index;
-	}
-
-	return indexOpt;
-}
 
 /* Data structure for collecting qual clauses that match an index */
 typedef struct
@@ -264,300 +233,6 @@ simple_match_clause_to_index(IndexOptInfo *index,
 		}
 	}
 }
-
-static List *
-deconstruct_indexquals_for_hybridquery(IndexOptInfo *index, List *index_quals, List *quals_columns)
-{
-	List	   *result = NIL;
-	ListCell   *lcc,
-			   *lci;
-
-	forboth(lcc, index_quals, lci, quals_columns)
-	{
-		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lcc);
-		int			indexcol = lfirst_int(lci);
-		Expr	   *clause;
-		Node	   *leftop,
-				   *rightop;
-		IndexQualInfo *qinfo;
-
-		clause = rinfo->clause;
-
-		qinfo = (IndexQualInfo *) palloc(sizeof(IndexQualInfo));
-		qinfo->rinfo = rinfo;
-		qinfo->indexcol = indexcol;
-
-		if (IsA(clause, OpExpr))
-		{
-			qinfo->clause_op = ((OpExpr *) clause)->opno;
-			leftop = get_leftop(clause);
-			rightop = get_rightop(clause);
-			if (match_index_to_operand(leftop, indexcol, index))
-			{
-				qinfo->varonleft = true;
-				qinfo->other_operand = rightop;
-			}
-			else
-			{
-				Assert(match_index_to_operand(rightop, indexcol, index));
-				qinfo->varonleft = false;
-				qinfo->other_operand = leftop;
-			}
-		}
-		else if (IsA(clause, RowCompareExpr))
-		{
-			RowCompareExpr *rc = (RowCompareExpr *) clause;
-
-			qinfo->clause_op = linitial_oid(rc->opnos);
-			/* Examine only first columns to determine left/right sides */
-			if (match_index_to_operand((Node *) linitial(rc->largs),
-									   indexcol, index))
-			{
-				qinfo->varonleft = true;
-				qinfo->other_operand = (Node *) rc->rargs;
-			}
-			else
-			{
-				Assert(match_index_to_operand((Node *) linitial(rc->rargs),
-											  indexcol, index));
-				qinfo->varonleft = false;
-				qinfo->other_operand = (Node *) rc->largs;
-			}
-		}
-		else if (IsA(clause, ScalarArrayOpExpr))
-		{
-			ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
-
-			qinfo->clause_op = saop->opno;
-			/* index column is always on the left in this case */
-			Assert(match_index_to_operand((Node *) linitial(saop->args),
-										  indexcol, index));
-			qinfo->varonleft = true;
-			qinfo->other_operand = (Node *) lsecond(saop->args);
-		}
-		else if (IsA(clause, NullTest))
-		{
-			qinfo->clause_op = InvalidOid;
-			Assert(match_index_to_operand((Node *) ((NullTest *) clause)->arg,
-										  indexcol, index));
-			qinfo->varonleft = true;
-			qinfo->other_operand = NULL;
-		}
-		else
-		{
-			elog(ERROR, "unsupported indexqual type: %d",
-				 (int) nodeTag(clause));
-		}
-
-		result = lappend(result, qinfo);
-	}
-	return result;
-}
-
-// static void
-// genericcostestimate_for_hybridquery(PlannerInfo *root,
-// 					IndexOptInfo *index,
-// 					List *indexQuals,
-// 					List *qinfos,
-// 					GenericCosts *costs)
-// {
-// 	// IndexOptInfo *index = path->indexinfo;
-// 	// List	   *indexQuals = path->indexquals;
-// 	// List	   *indexOrderBys = path->indexorderbys;
-// 	Cost		indexStartupCost;
-// 	Cost		indexTotalCost;
-// 	Selectivity indexSelectivity;
-// 	double		indexCorrelation;
-// 	double		numIndexPages;
-// 	double		numIndexTuples;
-// 	double		spc_random_page_cost;
-// 	double		num_sa_scans;
-// 	double		num_outer_scans;
-// 	double		num_scans;
-// 	double		qual_op_cost;
-// 	double		qual_arg_cost;
-// 	List	   *selectivityQuals;
-// 	ListCell   *l;
-
-// 	/*
-// 	 * If the index is partial, AND the index predicate with the explicitly
-// 	 * given indexquals to produce a more accurate idea of the index
-// 	 * selectivity.
-// 	 */
-// 	selectivityQuals = add_predicate_to_quals(index, indexQuals);
-
-// 	/*
-// 	 * Check for ScalarArrayOpExpr index quals, and estimate the number of
-// 	 * index scans that will be performed.
-// 	 */
-// 	num_sa_scans = 1;
-// 	foreach(l, indexQuals)
-// 	{
-// 		RestrictInfo *rinfo = (RestrictInfo *) lfirst(l);
-
-// 		if (IsA(rinfo->clause, ScalarArrayOpExpr))
-// 		{
-// 			ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) rinfo->clause;
-// 			int			alength = estimate_array_length(lsecond(saop->args));
-
-// 			if (alength > 1)
-// 				num_sa_scans *= alength;
-// 		}
-// 	}
-
-// 	/* Estimate the fraction of main-table tuples that will be visited */
-// 	indexSelectivity = clauselist_selectivity(root, selectivityQuals,
-// 											  index->rel->relid,
-// 											  JOIN_INNER,
-// 											  NULL);
-
-// 	/*
-// 	 * If caller didn't give us an estimate, estimate the number of index
-// 	 * tuples that will be visited.  We do it in this rather peculiar-looking
-// 	 * way in order to get the right answer for partial indexes.
-// 	 */
-// 	numIndexTuples = costs->numIndexTuples;
-// 	if (numIndexTuples <= 0.0)
-// 	{
-// 		numIndexTuples = indexSelectivity * index->rel->tuples;
-
-// 		/*
-// 		 * The above calculation counts all the tuples visited across all
-// 		 * scans induced by ScalarArrayOpExpr nodes.  We want to consider the
-// 		 * average per-indexscan number, so adjust.  This is a handy place to
-// 		 * round to integer, too.  (If caller supplied tuple estimate, it's
-// 		 * responsible for handling these considerations.)
-// 		 */
-// 		numIndexTuples = rint(numIndexTuples / num_sa_scans);
-// 	}
-
-// 	/*
-// 	 * We can bound the number of tuples by the index size in any case. Also,
-// 	 * always estimate at least one tuple is touched, even when
-// 	 * indexSelectivity estimate is tiny.
-// 	 */
-// 	if (numIndexTuples > index->tuples)
-// 		numIndexTuples = index->tuples;
-// 	if (numIndexTuples < 1.0)
-// 		numIndexTuples = 1.0;
-
-// 	/*
-// 	 * Estimate the number of index pages that will be retrieved.
-// 	 *
-// 	 * We use the simplistic method of taking a pro-rata fraction of the total
-// 	 * number of index pages.  In effect, this counts only leaf pages and not
-// 	 * any overhead such as index metapage or upper tree levels.
-// 	 *
-// 	 * In practice access to upper index levels is often nearly free because
-// 	 * those tend to stay in cache under load; moreover, the cost involved is
-// 	 * highly dependent on index type.  We therefore ignore such costs here
-// 	 * and leave it to the caller to add a suitable charge if needed.
-// 	 */
-// 	if (index->pages > 1 && index->tuples > 1)
-// 		numIndexPages = ceil(numIndexTuples * index->pages / index->tuples);
-// 	else
-// 		numIndexPages = 1.0;
-
-// 	/* fetch estimated page cost for tablespace containing index */
-// 	get_tablespace_page_costs(index->reltablespace,
-// 							  &spc_random_page_cost,
-// 							  NULL);
-
-// 	/*
-// 	 * Now compute the disk access costs.
-// 	 *
-// 	 * The above calculations are all per-index-scan.  However, if we are in a
-// 	 * nestloop inner scan, we can expect the scan to be repeated (with
-// 	 * different search keys) for each row of the outer relation.  Likewise,
-// 	 * ScalarArrayOpExpr quals result in multiple index scans.  This creates
-// 	 * the potential for cache effects to reduce the number of disk page
-// 	 * fetches needed.  We want to estimate the average per-scan I/O cost in
-// 	 * the presence of caching.
-// 	 *
-// 	 * We use the Mackert-Lohman formula (see costsize.c for details) to
-// 	 * estimate the total number of page fetches that occur.  While this
-// 	 * wasn't what it was designed for, it seems a reasonable model anyway.
-// 	 * Note that we are counting pages not tuples anymore, so we take N = T =
-// 	 * index size, as if there were one "tuple" per page.
-// 	 */
-// 	// NOTE: loop_count恒等于1
-// 	// num_outer_scans = loop_count;
-// 	num_outer_scans = 1;
-// 	num_scans = num_sa_scans * num_outer_scans;
-
-// 	if (num_scans > 1)
-// 	{
-// 		double		pages_fetched;
-
-// 		/* total page fetches ignoring cache effects */
-// 		pages_fetched = numIndexPages * num_scans;
-
-// 		/* use Mackert and Lohman formula to adjust for cache effects */
-// 		pages_fetched = index_pages_fetched(pages_fetched,
-// 											index->pages,
-// 											(double) index->pages,
-// 											root);
-
-// 		/*
-// 		 * Now compute the total disk access cost, and then report a pro-rated
-// 		 * share for each outer scan.  (Don't pro-rate for ScalarArrayOpExpr,
-// 		 * since that's internal to the indexscan.)
-// 		 */
-// 		indexTotalCost = (pages_fetched * spc_random_page_cost)
-// 			/ num_outer_scans;
-// 	}
-// 	else
-// 	{
-// 		/*
-// 		 * For a single index scan, we just charge spc_random_page_cost per
-// 		 * page touched.
-// 		 */
-// 		indexTotalCost = numIndexPages * spc_random_page_cost;
-// 	}
-
-// 	/*
-// 	 * CPU cost: any complex expressions in the indexquals will need to be
-// 	 * evaluated once at the start of the scan to reduce them to runtime keys
-// 	 * to pass to the index AM (see nodeIndexscan.c).  We model the per-tuple
-// 	 * CPU costs as cpu_index_tuple_cost plus one cpu_operator_cost per
-// 	 * indexqual operator.  Because we have numIndexTuples as a per-scan
-// 	 * number, we have to multiply by num_sa_scans to get the correct result
-// 	 * for ScalarArrayOpExpr cases.  Similarly add in costs for any index
-// 	 * ORDER BY expressions.
-// 	 *
-// 	 * Note: this neglects the possible costs of rechecking lossy operators.
-// 	 * Detecting that that might be needed seems more expensive than it's
-// 	 * worth, though, considering all the other inaccuracies here ...
-// 	 */
-// 	// NOTE: 直接去掉order by的代价
-// 	// qual_arg_cost = other_operands_eval_cost(root, qinfos) +
-// 	// 	orderby_operands_eval_cost(root, path);
-// 	// qual_op_cost = cpu_operator_cost *
-// 	// 	(list_length(indexQuals) + list_length(indexOrderBys));
-// 	qual_arg_cost = other_operands_eval_cost(root, qinfos);
-// 	qual_op_cost = cpu_operator_cost * list_length(indexQuals);
-
-// 	indexStartupCost = qual_arg_cost;
-// 	indexTotalCost += qual_arg_cost;
-// 	indexTotalCost += numIndexTuples * num_sa_scans * (cpu_index_tuple_cost + qual_op_cost);
-
-// 	/*
-// 	 * Generic assumption about index correlation: there isn't any.
-// 	 */
-// 	indexCorrelation = 0.0;
-
-// 	/*
-// 	 * Return everything to caller.
-// 	 */
-// 	costs->indexStartupCost = indexStartupCost;
-// 	costs->indexTotalCost = indexTotalCost;
-// 	costs->indexSelectivity = indexSelectivity;
-// 	costs->indexCorrelation = indexCorrelation;
-// 	costs->numIndexPages = numIndexPages;
-// 	costs->numIndexTuples = numIndexTuples;
-// 	costs->spc_random_page_cost = spc_random_page_cost;
-// 	costs->num_sa_scans = num_sa_scans;
-// }
 
 static IndexPath *
 create_structured_index_path(PlannerInfo *root,
@@ -706,132 +381,6 @@ find_structured_index_paths(PlannerInfo *root,
 	}
 
 	return index_paths;
-}
-
-/* 
-typedef struct IndexPath
-{
-	Path		path;
-	IndexOptInfo *indexinfo;
-	List	   *indexclauses;
-	List	   *indexquals;
-	List	   *indexqualcols;
-	List	   *indexorderbys;
-	List	   *indexorderbycols;
-	ScanDirection indexscandir;
-	Cost		indextotalcost;
-	Selectivity indexselectivity;
-} IndexPath;
-*/
-
-static double
-approximate_joinrel_size(PlannerInfo *root, Relids relids)
-{
-	double		rowcount = 1.0;
-	int			relid;
-
-	relid = -1;
-	while ((relid = bms_next_member(relids, relid)) >= 0)
-	{
-		RelOptInfo *rel;
-
-		/* Paranoia: ignore bogus relid indexes */
-		if (relid >= root->simple_rel_array_size)
-			continue;
-		rel = root->simple_rel_array[relid];
-		if (rel == NULL)
-			continue;
-		Assert(rel->relid == relid);	/* sanity check on array */
-
-		/* Relation could be proven empty, if so ignore */
-		if (IS_DUMMY_REL(rel))
-			continue;
-
-		/* Otherwise, rel's rows estimate should be valid by now */
-		Assert(rel->rows > 0);
-
-		/* Accumulate product */
-		rowcount *= rel->rows;
-	}
-	return rowcount;
-}
-
-static double
-adjust_rowcount_for_semijoins(PlannerInfo *root,
-							  Index cur_relid,
-							  Index outer_relid,
-							  double rowcount)
-{
-	ListCell   *lc;
-
-	foreach(lc, root->join_info_list)
-	{
-		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
-
-		if (sjinfo->jointype == JOIN_SEMI &&
-			bms_is_member(cur_relid, sjinfo->syn_lefthand) &&
-			bms_is_member(outer_relid, sjinfo->syn_righthand))
-		{
-			/* Estimate number of unique-ified rows */
-			double		nraw;
-			double		nunique;
-
-			nraw = approximate_joinrel_size(root, sjinfo->syn_righthand);
-			nunique = estimate_num_groups(root,
-										  sjinfo->semi_rhs_exprs,
-										  nraw,
-										  NULL);
-			if (rowcount > nunique)
-				rowcount = nunique;
-		}
-	}
-	return rowcount;
-}
-
-static double
-get_loop_count(PlannerInfo *root, Index cur_relid, Relids outer_relids)
-{
-	double		result;
-	int			outer_relid;
-
-	/* For a non-parameterized path, just return 1.0 quickly */
-	if (outer_relids == NULL)
-		return 1.0;
-
-	result = 0.0;
-	outer_relid = -1;
-	while ((outer_relid = bms_next_member(outer_relids, outer_relid)) >= 0)
-	{
-		RelOptInfo *outer_rel;
-		double		rowcount;
-
-		/* Paranoia: ignore bogus relid indexes */
-		if (outer_relid >= root->simple_rel_array_size)
-			continue;
-		outer_rel = root->simple_rel_array[outer_relid];
-		if (outer_rel == NULL)
-			continue;
-		Assert(outer_rel->relid == outer_relid);	/* sanity check on array */
-
-		/* Other relation could be proven empty, if so ignore */
-		if (IS_DUMMY_REL(outer_rel))
-			continue;
-
-		/* Otherwise, rel's rows estimate should be valid by now */
-		Assert(outer_rel->rows > 0);
-
-		/* Check to see if rel is on the inside of any semijoins */
-		rowcount = adjust_rowcount_for_semijoins(root,
-												 cur_relid,
-												 outer_relid,
-												 outer_rel->rows);
-
-		/* Remember smallest row count estimate among the outer rels */
-		if (result == 0.0 || result > rowcount)
-			result = rowcount;
-	}
-	/* Return 1.0 if we found no valid relations (shouldn't happen) */
-	return (result > 0.0) ? result : 1.0;
 }
 
 /* XXX see PartCollMatchesExprColl */
@@ -1180,18 +729,95 @@ find_anns_index_paths(PlannerInfo *root,
 // 	structured_anns_cost += structured_anns_anns_io_cost;
 // }
 
+typedef struct PGIVFPQPageOpaqueData
+{
+	uint16 flag;
+	OffsetNumber max_offset;
+	BlockNumber next_page_blkno;
+} PGIVFPQPageOpaqueData;
+
+typedef struct PGIVFPQIVFCentroidTuple
+{
+	// TODO: FLEXIBLE_ARRAY_MEMBER
+	float centroid[512];
+	BlockNumber data_entry_blkno;
+} PGIVFPQIVFCentroidTuple;
+
+typedef struct PGIVFPQPQCentroidTuple
+{
+	// TODO: FLEXIBLE_ARRAY_MEMBER
+	float centroid[4*256];
+} PGIVFPQPQCentroidTuple;
+
+typedef struct PGIVFPQDataTuple
+{
+	// TODO: FLEXIBLE_ARRAY_MEMBER
+	ItemPointerData ipd;
+	uint8 pq_code[128];	
+} PGIVFPQDataTuple;
+
 static Cost
 estimate_hybrid_ivfpq_cost(IndexPath *index_path, Selectivity selectivity)
 {
 	Cost total_cost = 0.0;
-	Cost io_cost;
-	Cost cpu_cost;
+	Cost io_cost = 0.0;
+	Cost cpu_cost = 0.0;
 
-	// TODO:
-	int32 n = 1000000;
-	
-	io_cost = selectivity * n * DEFAULT_RANDOM_PAGE_COST;
-	cpu_cost = selectivity * n * cost_from_distance_tables;
+	/* 
+	 * NOTE:
+	 * 由结构化条件筛选出来的结果，在IVFPQ算法的IVF中不一定是均匀分布的，
+	 * 因此此处计算代价时，没有将搜索参数nprobe引入进来，
+	 * 而是直接假设结构化条件筛选出来的结果全部在前nprobe个IVF以内，
+	 * 但是在搜索时，会判断每个结构化条件筛选出来的结果所在的IVF，
+	 * 对于不属于前nprobe个IVF的结果，则不参与距离计算。
+	 */
+
+	int32 io_cnt = 0;
+	int32 cpu_cnt = 0;
+
+	/* 
+	 * NOTE:
+	 * 现在的代价计算，只能用于与联合查询的向量搜索的代价比较，
+	 * 而不能用于与暴力搜索的代价比较，原因如下：
+	 * 1. 暴力搜索的距离计算（两个feature之间）与向量搜索的距离计算（两个feature的pq码之间，
+	 *    且实际计算时使用了distance_table），没有在同一操作符下进行比较；
+	 * 2. 暴力搜索时调用底层操作符的代价，其计算方式暂时不明确。
+	 */
+
+	/* 
+	 * TODO:
+	 * 1. 获取索引创建的相关参数（dimension、ivf num、pq num、pq centroid num）和索引搜索的相关参数（nprobe）;
+	 * 2. 获取索引数量。
+	 */
+	int32 ivf_centroid_num = 512;
+	int32 pq_per_sub_centroid_num = 256;
+	int32 nprobe = 128;
+	int32 ntotal = 1000000;
+
+	Size page_sz = BLCKSZ;
+	Size page_opaque_sz = MAXALIGN(sizeof(PGIVFPQPageOpaqueData));
+	Size ivf_ctup_sz = MAXALIGN(sizeof(PGIVFPQIVFCentroidTuple));
+	Size pq_ctup_sz = MAXALIGN(sizeof(PGIVFPQPQCentroidTuple));
+	Size dtup_sz = MAXALIGN(sizeof(PGIVFPQDataTuple));
+
+	int32 per_page_ivf_ctup_num = (page_sz - page_opaque_sz) / ivf_ctup_sz;
+	int32 per_page_pq_ctup_num = (page_sz - page_opaque_sz) / pq_ctup_sz;
+	int32 per_page_dtup_num = (page_sz - page_opaque_sz) / dtup_sz;
+
+	/* IO cost: a. 搜索最近的ivf；b. compute residuals；c. 计算distance_table；d. 扫描IVF。 */
+	io_cnt += ceil((float) ivf_centroid_num / per_page_ivf_ctup_num);
+	io_cnt += nprobe;
+	io_cnt += ceil((float) pq_per_sub_centroid_num / per_page_pq_ctup_num);
+	/* NOTE: 每个IVF的数据量与数据分布有关，因此这里对IVF扫描的IO次数不能确定，这里的估计假设数据是均匀分布的，每个IVF的数据量一致。 */
+	io_cnt += ceil(selectivity * ntotal);
+
+	/* CPU cost: a. 搜索最近的ivf（没有CPU cost）；b. compute residuals（没有CPU cost）；c. 计算distance_table（没有CPU cost）；d. 扫描IVF。 */
+	/* FIXME: 现在CPU cost只计算通过distance_table进行距离计算的次数。 */
+	/* NOTE: 每个IVF的数据量与数据分布有关，因此这里对IVF扫描的IO次数不能确定，这里的估计假设数据是均匀分布的，每个IVF的数据量一致。 */
+	cpu_cnt += ceil(selectivity * ntotal);
+
+	io_cost = io_cnt * DEFAULT_RANDOM_PAGE_COST;
+	cpu_cost = cpu_cnt * cost_from_distance_tables;
 
 	total_cost += io_cost + cpu_cost;
 
@@ -1211,7 +837,7 @@ find_best_paths(List *structured_index_paths, List *anns_index_paths,
 	Cost not_hybrid_cost;
 
 	Selectivity min_selectivity = 1.0;
-	Cost		min_anns_cost = DBL_MAX;
+	Cost		min_anns_cost = disable_cost;
 
 	/* 
 	 * NOTE:
@@ -1357,10 +983,10 @@ set_hybridquery_path(PlannerInfo *root, RelOptInfo *baserel,
 
 	// TODO: 待确认startup_cost和total_cost这样设置是否正确
 	cpath->path.rows = 512;  // TODO: be fixed to 512 now and to be fixed later.
-	// cpath->path.startup_cost = best_structured_index_path->indextotalcost;
-	// cpath->path.total_cost = best_anns_index_path->indextotalcost;
-	cpath->path.startup_cost = 0.0;
-	cpath->path.total_cost = 0.0;
+	cpath->path.startup_cost = best_structured_index_path->indextotalcost;
+	cpath->path.total_cost = best_anns_index_path->indextotalcost;
+	// cpath->path.startup_cost = 0.0;
+	// cpath->path.total_cost = 0.0;
 
 	cpath->path.pathkeys = root->query_pathkeys;
 
@@ -2217,7 +1843,6 @@ CreateHybridQueryScanState(CustomScan *custom_plan)
 	HybridQueryState  *hqs = (HybridQueryState *)palloc0(sizeof(HybridQueryState));
 
 	NodeSetTag(hqs, T_CustomScanState);
-	hqs->css.flags = custom_plan->flags;
 	hqs->css.custom_ps = NIL;
 	hqs->css.pscan_len = 0;
 	hqs->css.methods = &hybridquery_exec_methods;
@@ -2228,32 +1853,347 @@ CreateHybridQueryScanState(CustomScan *custom_plan)
 static IndexScanState *
 init_structured_iss(IndexScan *node, EState *estate, int eflags)
 {
-	IndexScanState *result;
-	result = (IndexScanState *) ExecInitNode(&(node->scan.plan), estate, eflags);
-	return result;
+	IndexScanState *indexstate;
+	indexstate = (IndexScanState *) ExecInitNode(&(node->scan.plan), estate, eflags);
+	indexstate->ss.ps.ps_ProjInfo = NULL;
+	return indexstate;
+
+	// IndexScanState *indexstate;
+	// Relation	currentRelation;
+	// bool		relistarget;
+
+	// /*
+	//  * create state structure
+	//  */
+	// indexstate = makeNode(IndexScanState);
+	// indexstate->ss.ps.plan = (Plan *) node;
+	// indexstate->ss.ps.state = estate;
+	// indexstate->ss.ps.ExecProcNode = ExecHybridQueryStructuredScan;  // TODO:
+
+	// /*
+	//  * Miscellaneous initialization
+	//  *
+	//  * create expression context for node
+	//  */
+	// ExecAssignExprContext(estate, &indexstate->ss.ps);
+
+	// /*
+	//  * open the base relation and acquire appropriate lock on it.
+	//  */
+	// currentRelation = ExecOpenScanRelation(estate, node->scan.scanrelid, eflags);
+
+	// indexstate->ss.ss_currentRelation = currentRelation;
+	// indexstate->ss.ss_currentScanDesc = NULL;	/* no heap scan here */
+
+	// // NOTE: 不会用到ss.ss_ScanTupleSlot，但是也要分配内存，ExecScanReScan函数里面会销毁它，
+	// // 如果不分配内存，该函数会执行出错。
+	// /*
+	//  * get the scan type from the relation descriptor.
+	//  */
+	// ExecInitScanTupleSlot(estate, &indexstate->ss,
+	// 					  RelationGetDescr(currentRelation));
+
+	// // NOTE: 不会用到ss.ps.ps_ResultTupleSlot，但是也要分配内存，ExecEndIndexScan函数里面会销毁它，
+	// // 如果不分配内存，该函数会执行出错。
+	// /*
+	//  * Initialize result slot, type and projection.
+	//  */
+	// ExecInitResultTupleSlotTL(estate, &indexstate->ss.ps);
+	// // ExecAssignScanProjectionInfo(&indexstate->ss);
+	// indexstate->ss.ps.ps_ProjInfo = NULL;
+
+
+	// // NOTE: IndexScan中对应的字段为NIL，则ExecInitQual会返回NULL，ExecInitExprList会返回NIL。因此此处可以不用处理。
+	// /*
+	//  * initialize child expressions
+	//  *
+	//  * Note: we don't initialize all of the indexqual expression, only the
+	//  * sub-parts corresponding to runtime keys (see below).  Likewise for
+	//  * indexorderby, if any.  But the indexqualorig expression is always
+	//  * initialized even though it will only be used in some uncommon cases ---
+	//  * would be nice to improve that.  (Problem is that any SubPlans present
+	//  * in the expression must be found now...)
+	//  */
+	// indexstate->ss.ps.qual =
+	// 	ExecInitQual(node->scan.plan.qual, (PlanState *) indexstate);
+	// indexstate->indexqualorig =
+	// 	ExecInitQual(node->indexqualorig, (PlanState *) indexstate);
+	// indexstate->indexorderbyorig =
+	// 	ExecInitExprList(node->indexorderbyorig, (PlanState *) indexstate);
+
+	// /*
+	//  * If we are just doing EXPLAIN (ie, aren't going to run the plan), stop
+	//  * here.  This allows an index-advisor plugin to EXPLAIN a plan containing
+	//  * references to nonexistent indexes.
+	//  */
+	// if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
+	// 	return indexstate;
+
+	// /*
+	//  * Open the index relation.
+	//  *
+	//  * If the parent table is one of the target relations of the query, then
+	//  * InitPlan already opened and write-locked the index, so we can avoid
+	//  * taking another lock here.  Otherwise we need a normal reader's lock.
+	//  */
+	// relistarget = ExecRelationIsTargetRelation(estate, node->scan.scanrelid);
+	// indexstate->iss_RelationDesc = index_open(node->indexid,
+	// 										  relistarget ? NoLock : AccessShareLock);
+
+	// /*
+	//  * Initialize index-specific scan state
+	//  */
+	// indexstate->iss_RuntimeKeysReady = false;
+	// indexstate->iss_RuntimeKeys = NULL;
+	// indexstate->iss_NumRuntimeKeys = 0;
+
+	// /*
+	//  * build the index scan keys from the index qualification
+	//  */
+	// ExecIndexBuildScanKeys((PlanState *) indexstate,
+	// 					   indexstate->iss_RelationDesc,
+	// 					   node->indexqual,
+	// 					   false,
+	// 					   &indexstate->iss_ScanKeys,
+	// 					   &indexstate->iss_NumScanKeys,
+	// 					   &indexstate->iss_RuntimeKeys,
+	// 					   &indexstate->iss_NumRuntimeKeys,
+	// 					   NULL,	/* no ArrayKeys */
+	// 					   NULL);
+
+	// // TODO: 只需要iss_ScanKeys，不需要iss_OrderByKeys
+	// /*
+	//  * any ORDER BY exprs have to be turned into scankeys in the same way
+	//  */
+	// ExecIndexBuildScanKeys((PlanState *) indexstate,
+	// 					   indexstate->iss_RelationDesc,
+	// 					   node->indexorderby,
+	// 					   true,
+	// 					   &indexstate->iss_OrderByKeys,
+	// 					   &indexstate->iss_NumOrderByKeys,
+	// 					   &indexstate->iss_RuntimeKeys,
+	// 					   &indexstate->iss_NumRuntimeKeys,
+	// 					   NULL,	/* no ArrayKeys */
+	// 					   NULL);
+
+	// // TODO: 这里不用处理
+	// /* Initialize sort support, if we need to re-check ORDER BY exprs */
+	// if (indexstate->iss_NumOrderByKeys > 0)
+	// {
+	// 	int			numOrderByKeys = indexstate->iss_NumOrderByKeys;
+	// 	int			i;
+	// 	ListCell   *lco;
+	// 	ListCell   *lcx;
+
+	// 	/*
+	// 	 * Prepare sort support, and look up the data type for each ORDER BY
+	// 	 * expression.
+	// 	 */
+	// 	Assert(numOrderByKeys == list_length(node->indexorderbyops));
+	// 	Assert(numOrderByKeys == list_length(node->indexorderbyorig));
+	// 	indexstate->iss_SortSupport = (SortSupportData *)
+	// 		palloc0(numOrderByKeys * sizeof(SortSupportData));
+	// 	indexstate->iss_OrderByTypByVals = (bool *)
+	// 		palloc(numOrderByKeys * sizeof(bool));
+	// 	indexstate->iss_OrderByTypLens = (int16 *)
+	// 		palloc(numOrderByKeys * sizeof(int16));
+	// 	i = 0;
+	// 	forboth(lco, node->indexorderbyops, lcx, node->indexorderbyorig)
+	// 	{
+	// 		Oid			orderbyop = lfirst_oid(lco);
+	// 		Node	   *orderbyexpr = (Node *) lfirst(lcx);
+	// 		Oid			orderbyType = exprType(orderbyexpr);
+	// 		Oid			orderbyColl = exprCollation(orderbyexpr);
+	// 		SortSupport orderbysort = &indexstate->iss_SortSupport[i];
+
+	// 		/* Initialize sort support */
+	// 		orderbysort->ssup_cxt = CurrentMemoryContext;
+	// 		orderbysort->ssup_collation = orderbyColl;
+	// 		/* See cmp_orderbyvals() comments on NULLS LAST */
+	// 		orderbysort->ssup_nulls_first = false;
+	// 		/* ssup_attno is unused here and elsewhere */
+	// 		orderbysort->ssup_attno = 0;
+	// 		/* No abbreviation */
+	// 		orderbysort->abbreviate = false;
+	// 		PrepareSortSupportFromOrderingOp(orderbyop, orderbysort);
+
+	// 		get_typlenbyval(orderbyType,
+	// 						&indexstate->iss_OrderByTypLens[i],
+	// 						&indexstate->iss_OrderByTypByVals[i]);
+	// 		i++;
+	// 	}
+
+	// 	/* allocate arrays to hold the re-calculated distances */
+	// 	indexstate->iss_OrderByValues = (Datum *)
+	// 		palloc(numOrderByKeys * sizeof(Datum));
+	// 	indexstate->iss_OrderByNulls = (bool *)
+	// 		palloc(numOrderByKeys * sizeof(bool));
+
+	// 	/* and initialize the reorder queue */
+	// 	// indexstate->iss_ReorderQueue = pairingheap_allocate(reorderqueue_cmp,
+	// 	// 													indexstate);
+	// 	// TODO:
+	// 	indexstate->iss_ReorderQueue = NULL;
+	// }
+
+	// // TODO: 搞清楚这里
+	// /*
+	//  * If we have runtime keys, we need an ExprContext to evaluate them. The
+	//  * node's standard context won't do because we want to reset that context
+	//  * for every tuple.  So, build another context just like the other one...
+	//  * -tgl 7/11/00
+	//  */
+	// if (indexstate->iss_NumRuntimeKeys != 0)
+	// {
+	// 	ExprContext *stdecontext = indexstate->ss.ps.ps_ExprContext;
+
+	// 	ExecAssignExprContext(estate, &indexstate->ss.ps);
+	// 	indexstate->iss_RuntimeContext = indexstate->ss.ps.ps_ExprContext;
+	// 	indexstate->ss.ps.ps_ExprContext = stdecontext;
+	// }
+	// else
+	// {
+	// 	indexstate->iss_RuntimeContext = NULL;
+	// }
+
+	// /*
+	//  * all done.
+	//  */
+	// return indexstate;
+}
+
+/*
+ * When an ordering operator is used, tuples fetched from the index that
+ * need to be reordered are queued in a pairing heap, as ReorderTuples.
+ */
+typedef struct
+{
+	pairingheap_node ph_node;
+	HeapTuple	htup;
+	Datum	   *orderbyvals;
+	bool	   *orderbynulls;
+} ReorderTuple;
+
+static int
+cmp_orderbyvals(const Datum *adist, const bool *anulls,
+				const Datum *bdist, const bool *bnulls,
+				IndexScanState *node)
+{
+	int			i;
+	int			result;
+
+	for (i = 0; i < node->iss_NumOrderByKeys; i++)
+	{
+		SortSupport ssup = &node->iss_SortSupport[i];
+
+		/*
+		 * Handle nulls.  We only need to support NULLS LAST ordering, because
+		 * match_pathkeys_to_index() doesn't consider indexorderby
+		 * implementation otherwise.
+		 */
+		if (anulls[i] && !bnulls[i])
+			return 1;
+		else if (!anulls[i] && bnulls[i])
+			return -1;
+		else if (anulls[i] && bnulls[i])
+			return 0;
+
+		result = ssup->comparator(adist[i], bdist[i], ssup);
+		if (result != 0)
+			return result;
+	}
+
+	return 0;
+}
+
+static int
+reorderqueue_cmp(const pairingheap_node *a, const pairingheap_node *b,
+				 void *arg)
+{
+	ReorderTuple *rta = (ReorderTuple *) a;
+	ReorderTuple *rtb = (ReorderTuple *) b;
+	IndexScanState *node = (IndexScanState *) arg;
+
+	/* exchange argument order to invert the sort order */
+	return cmp_orderbyvals(rtb->orderbyvals, rtb->orderbynulls,
+						   rta->orderbyvals, rta->orderbynulls,
+						   node);
 }
 
 static IndexScanState *
 init_anns_iss(IndexScan *node, EState *estate, int eflags)
 {
-	IndexScanState *result;
-	result = (IndexScanState *) ExecInitNode(&(node->scan.plan), estate, eflags);
-	return result;
+	// IndexScanState *indexstate;
+	// indexstate = (IndexScanState *) ExecInitNode(&(node->scan.plan), estate, eflags);
+	// indexstate->ss.ps.ps_ProjInfo = NULL;
+	// return indexstate;
 
 	/*
+	 * do nothing when we get to the end of a leaf on tree.
+	 */
+	if (node == NULL)
+		return NULL;
+
+	/*
+	 * Make sure there's enough stack available. Need to check here, in
+	 * addition to ExecProcNode() (via ExecProcNodeFirst()), to ensure the
+	 * stack isn't overrun while initializing the node tree.
+	 */
+	check_stack_depth();
+	
 	IndexScanState *indexstate;
 	Relation	currentRelation;
 	bool		relistarget;
 
 	indexstate = makeNode(IndexScanState);
+	indexstate->ss.ps.plan = (Plan *) node;
+	indexstate->ss.ps.state = estate;
+	// indexstate->ss.ps.ExecProcNode = ExecHybridQueryANNSScan;  // TODO:
+	indexstate->ss.ps.ExecProcNode = NULL;  // TODO:
 
+	/*
+	 * Miscellaneous initialization
+	 *
+	 * create expression context for node
+	 */
+	ExecAssignExprContext(estate, &indexstate->ss.ps);
+
+	/*
+	 * open the base relation and acquire appropriate lock on it.
+	 */
+	currentRelation = ExecOpenScanRelation(estate, node->scan.scanrelid, eflags);
+
+	indexstate->ss.ss_currentRelation = currentRelation;
+	indexstate->ss.ss_currentScanDesc = NULL;	/* no heap scan here */
+
+	// NOTE: 不会用到ss.ss_ScanTupleSlot，但是也要分配内存，ExecScanReScan函数里面会销毁它，
+	// 如果不分配内存，该函数会执行出错。
+	/*
+	 * get the scan type from the relation descriptor.
+	 */
+	ExecInitScanTupleSlot(estate, &indexstate->ss,
+						  RelationGetDescr(currentRelation));
+
+	// NOTE: 不会用到ss.ps.ps_ResultTupleSlot，但是也要分配内存，ExecEndIndexScan函数里面会销毁它，
+	// 如果不分配内存，该函数会执行出错。
+	/*
+	 * Initialize result slot, type and projection.
+	 */
+	ExecInitResultTupleSlotTL(estate, &indexstate->ss.ps);
+	// ExecAssignScanProjectionInfo(&indexstate->ss);
+	indexstate->ss.ps.ps_ProjInfo = NULL;
+
+	// NOTE: IndexScan中对应的字段为NIL，则ExecInitQual会返回NULL，ExecInitExprList会返回NIL。因此此处可以不用处理。
+	indexstate->ss.ps.qual =
+		ExecInitQual(node->scan.plan.qual, (PlanState *) indexstate);
+	indexstate->ss.ps.qual = NULL;
 	indexstate->indexqualorig =
-		ExecInitQual(node->indexqualorig, (PlanState *) hqs);
+		ExecInitQual(node->indexqualorig, (PlanState *) indexstate);
 	indexstate->indexorderbyorig =
-		ExecInitExprList(node->indexorderbyorig, (PlanState *) hqs);
+		ExecInitExprList(node->indexorderbyorig, (PlanState *) indexstate);
 	
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
-		return;
+		return indexstate;
 	
 	relistarget = ExecRelationIsTargetRelation(estate, node->scan.scanrelid);
 	indexstate->iss_RelationDesc = index_open(node->indexid,
@@ -2263,7 +2203,8 @@ init_anns_iss(IndexScan *node, EState *estate, int eflags)
 	indexstate->iss_RuntimeKeys = NULL;
 	indexstate->iss_NumRuntimeKeys = 0;
 
-	ExecIndexBuildScanKeys((PlanState *) hqs,
+	// TODO: 只需要iss_OrderByKeys，不需要iss_ScanKeys
+	ExecIndexBuildScanKeys((PlanState *) indexstate,
 						   indexstate->iss_RelationDesc,
 						   node->indexqual,
 						   false,
@@ -2271,10 +2212,10 @@ init_anns_iss(IndexScan *node, EState *estate, int eflags)
 						   &indexstate->iss_NumScanKeys,
 						   &indexstate->iss_RuntimeKeys,
 						   &indexstate->iss_NumRuntimeKeys,
-						   NULL,
+						   NULL,	/* no ArrayKeys */
 						   NULL);
 
-	ExecIndexBuildScanKeys((PlanState *) hqs,
+	ExecIndexBuildScanKeys((PlanState *) indexstate,
 						   indexstate->iss_RelationDesc,
 						   node->indexorderby,
 						   true,
@@ -2282,9 +2223,10 @@ init_anns_iss(IndexScan *node, EState *estate, int eflags)
 						   &indexstate->iss_NumOrderByKeys,
 						   &indexstate->iss_RuntimeKeys,
 						   &indexstate->iss_NumRuntimeKeys,
-						   NULL,
+						   NULL,	/* no ArrayKeys */
 						   NULL);
 
+	/* Initialize sort support, if we need to re-check ORDER BY exprs */
 	if (indexstate->iss_NumOrderByKeys > 0)
 	{
 		int			numOrderByKeys = indexstate->iss_NumOrderByKeys;
@@ -2292,6 +2234,10 @@ init_anns_iss(IndexScan *node, EState *estate, int eflags)
 		ListCell   *lco;
 		ListCell   *lcx;
 
+		/*
+		 * Prepare sort support, and look up the data type for each ORDER BY
+		 * expression.
+		 */
 		Assert(numOrderByKeys == list_length(node->indexorderbyops));
 		Assert(numOrderByKeys == list_length(node->indexorderbyorig));
 		indexstate->iss_SortSupport = (SortSupportData *)
@@ -2309,13 +2255,14 @@ init_anns_iss(IndexScan *node, EState *estate, int eflags)
 			Oid			orderbyColl = exprCollation(orderbyexpr);
 			SortSupport orderbysort = &indexstate->iss_SortSupport[i];
 
+			/* Initialize sort support */
 			orderbysort->ssup_cxt = CurrentMemoryContext;
 			orderbysort->ssup_collation = orderbyColl;
-			
+			/* See cmp_orderbyvals() comments on NULLS LAST */
 			orderbysort->ssup_nulls_first = false;
-			
+			/* ssup_attno is unused here and elsewhere */
 			orderbysort->ssup_attno = 0;
-			
+			/* No abbreviation */
 			orderbysort->abbreviate = false;
 			PrepareSortSupportFromOrderingOp(orderbyop, orderbysort);
 
@@ -2325,32 +2272,51 @@ init_anns_iss(IndexScan *node, EState *estate, int eflags)
 			i++;
 		}
 
-		
+		/* allocate arrays to hold the re-calculated distances */
 		indexstate->iss_OrderByValues = (Datum *)
 			palloc(numOrderByKeys * sizeof(Datum));
 		indexstate->iss_OrderByNulls = (bool *)
 			palloc(numOrderByKeys * sizeof(bool));
 
-		
-		// TODO: 现在暂时不用这个
+		/* and initialize the reorder queue */
+		// indexstate->iss_ReorderQueue = pairingheap_allocate(reorderqueue_cmp,
+		// 													indexstate);
+		// TODO:
 		indexstate->iss_ReorderQueue = NULL;
 	}
 
+	// TODO: 搞清楚这里
+	/*
+	 * If we have runtime keys, we need an ExprContext to evaluate them. The
+	 * node's standard context won't do because we want to reset that context
+	 * for every tuple.  So, build another context just like the other one...
+	 * -tgl 7/11/00
+	 */
 	if (indexstate->iss_NumRuntimeKeys != 0)
 	{
-		ExprContext *stdecontext = hqs->css.ss.ps.ps_ExprContext;
+		ExprContext *stdecontext = indexstate->ss.ps.ps_ExprContext;
 
-		ExecAssignExprContext(estate, &hqs->css.ss.ps);
-		indexstate->iss_RuntimeContext = hqs->css.ss.ps.ps_ExprContext;
-		hqs->css.ss.ps.ps_ExprContext = stdecontext;
+		ExecAssignExprContext(estate, &indexstate->ss.ps);
+		indexstate->iss_RuntimeContext = indexstate->ss.ps.ps_ExprContext;
+		indexstate->ss.ps.ps_ExprContext = stdecontext;
 	}
 	else
 	{
 		indexstate->iss_RuntimeContext = NULL;
 	}
 
-	return NULL;
-	*/
+	indexstate->ss.ps.ExecProcNodeReal = NULL;
+
+	indexstate->ss.ps.initPlan = NIL;
+
+	/* Set up instrumentation for this node if requested */
+	if (estate->es_instrument)
+		indexstate->ss.ps.instrument = InstrAlloc(1, estate->es_instrument);
+
+	/*
+	 * all done.
+	 */
+	return indexstate;
 }
 
 /*
@@ -2367,17 +2333,14 @@ BeginHybridQueryScan(CustomScanState *css, EState *estate, int eflags)
 										   estate, eflags);
 	anns_iss = init_anns_iss((IndexScan *)hqs->css.ss.ps.plan->righttree,
 							  estate, eflags);
-	
-	hqs->css.ss.ps.lefttree = (PlanState *)structured_iss;
-	hqs->css.ss.ps.righttree = (PlanState *)anns_iss;
-
-	hqs->css.ss.ss_currentScanDesc = NULL;  /* no heap scan here */
 
 	/* 
 	 * NOTE:
 	 * CustomScanState的其余成员在ExecInitCustomScan中被初始化。
-	 * 注意CreateCustomScanState和BeginHybridQueryScan这两个成员函数需要完成的功能。
+	 * 注意CreateCustomScanState和BeginCustomScan这两个成员函数需要完成的功能。
 	 */
+	hqs->css.ss.ps.lefttree = (PlanState *)structured_iss;
+	hqs->css.ss.ps.righttree = (PlanState *)anns_iss;
 	
 	return;
 }
@@ -2391,6 +2354,34 @@ typedef struct PGIVFPQScanOpaqueData
 	bool first_call;
 } PGIVFPQScanOpaqueData;
 typedef PGIVFPQScanOpaqueData * PGIVFPQScanOpaque;
+
+static void
+ExecStructuredIndexScan(IndexScanState *structured_iss,
+						std::vector<ItemPointerData> &output)
+{
+	TupleTableSlot	*structured_slot;
+	int				 structured_cnt = 0;
+	std::chrono::steady_clock::time_point total_start, total_end;
+    double total_time;
+
+	total_start = std::chrono::steady_clock::now();
+	for (;;)
+	{
+		structured_slot = ExecProcNode(&structured_iss->ss.ps);
+		if (TupIsNull(structured_slot))
+		{
+			break;
+		}
+		else
+		{
+			output.push_back(structured_slot->tts_tuple->t_self);
+			structured_cnt++;
+		}
+	}
+	total_end = std::chrono::steady_clock::now();
+	total_time = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(total_end - total_start).count();
+	elog(WARNING, "structured_cnt: %d, total_time: %f ms", structured_cnt, total_time);
+}
 
 /*
  * HybridQueryAccess
@@ -2459,36 +2450,21 @@ HybridQueryAccess(CustomScanState *css)
 	/* 结构化索引扫描 */
 	// TODO: 把结构化条件的结果存放在opaque中，但是需要抽象出来作为基类，这样就不依赖某种特定的向量索引了，但所有向量索引的opaque都需要继承这个基类
 	std::vector<ItemPointerData> ipd_vec;
-	TupleTableSlot	*structured_slot;
-	int				structured_cnt = 0;
 	PGIVFPQScanOpaque so = (PGIVFPQScanOpaque)scandesc->opaque;
+
 	if (so->first_call)
 	{
-		for (;;)
-		{
-			elog(WARNING, "structured_cnt: %d", structured_cnt);
-			structured_slot = ExecProcNode(outerNode);
-			if (TupIsNull(structured_slot))
-			{
-				break;
-			}
-			else
-			{
-				ipd_vec.push_back(structured_slot->tts_tuple->t_self);
-				structured_cnt++;
-			}
-		}
-		elog(WARNING, "structured_cnt: %d", structured_cnt);
+		ExecStructuredIndexScan((IndexScanState *) outerNode, ipd_vec);
 
 		MemoryContext old_ctx;
 
 		old_ctx = MemoryContextSwitchTo(so->scan_ctx);
-		ItemPointerData *quals_ipds = (ItemPointerData *) palloc0(sizeof(ItemPointerData) * structured_cnt);
-		for (int i = 0; i < structured_cnt; i++)
+		ItemPointerData *quals_ipds = (ItemPointerData *) palloc0(sizeof(ItemPointerData) * ipd_vec.size());
+		for (int i = 0; i < ipd_vec.size(); i++)
 			quals_ipds[i] = ipd_vec[i];
 		
 		so->quals_ipds = quals_ipds;
-		so->quals_ipds_cnt = structured_cnt;
+		so->quals_ipds_cnt = ipd_vec.size();
 
 		MemoryContextSwitchTo(old_ctx);
 	}
@@ -2599,35 +2575,8 @@ ReScanHybridQueryScan(CustomScanState *node)
 	outerNode = outerPlanState(hqs);
 	innerNode = innerPlanState(hqs);
 
-	// // 对比nodeCustom.c的ExecReScanCustomScan函数和nodeIndexscan.c的ExecReScanIndexScan函数，按照后者的处理方式，完成本函数。
-	// if (hqs->iss_NumRuntimeKeys != 0)
-	// {
-	// 	ExprContext *econtext = hqs->iss_RuntimeContext;
-
-	// 	ResetExprContext(econtext);
-	// 	ExecIndexEvalRuntimeKeys(econtext,
-	// 							 hqs->iss_RuntimeKeys,
-	// 							 hqs->iss_NumRuntimeKeys);
-	// }
-	// hqs->iss_RuntimeKeysReady = true;
-
-	// /* flush the reorder queue */
-	// if (hqs->iss_ReorderQueue)
-	// {
-	// 	// TODO: 现在暂时不用这个
-	// }
-
-	// /* reset index scan */
-	// if (hqs->iss_ScanDesc)
-	// 	index_rescan(hqs->iss_ScanDesc,
-	// 				 hqs->iss_ScanKeys, hqs->iss_NumScanKeys,
-	// 				 hqs->iss_OrderByKeys, hqs->iss_NumOrderByKeys);
-	// hqs->iss_ReachedEnd = false;
-
-	// ExecScanReScan(&hqs->css.ss);
-
-	ExecScanReScan((ScanState *)outerNode);
-	ExecScanReScan((ScanState *)innerNode);
+	ExecReScan(outerNode);
+	ExecReScan(innerNode);
 }
 
 /*
@@ -2661,9 +2610,9 @@ _PG_init(void)
 							 "Cost of compute distance from distance tables",
 							 NULL,
 							 &cost_from_distance_tables,
-							 DEFAULT_CPU_OPERATOR_COST / 32.0,
+							 DEFAULT_CPU_OPERATOR_COST * 1000.0,
 							 0,
-							 DBL_MAX,
+							 disable_cost,
 							 PGC_USERSET,
 							 GUC_NOT_IN_SAMPLE,
 							 NULL, NULL, NULL);
@@ -2673,9 +2622,9 @@ _PG_init(void)
 							 "Cost of compute distance from two codes",
 							 NULL,
 							 &cost_from_two_codes,
-							 DEFAULT_CPU_OPERATOR_COST / 16.0,
+							 DEFAULT_CPU_OPERATOR_COST * 2000.0,
 							 0,
-							 DBL_MAX,
+							 disable_cost,
 							 PGC_USERSET,
 							 GUC_NOT_IN_SAMPLE,
 							 NULL, NULL, NULL);
