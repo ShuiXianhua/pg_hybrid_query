@@ -9,6 +9,7 @@ extern "C"
 #include "postgres.h"
 #include "access/relscan.h"
 #include "access/sysattr.h"
+#include "access/amapi.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_statistic.h"
@@ -235,6 +236,145 @@ simple_match_clause_to_index(IndexOptInfo *index,
 	}
 }
 
+static List *
+extract_nonindex_conditions(List *qual_clauses, List *indexquals)
+{
+	List	   *result = NIL;
+	ListCell   *lc;
+
+	foreach(lc, qual_clauses)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+		if (rinfo->pseudoconstant)
+			continue;			/* we may drop pseudoconstants here */
+		if (list_member_ptr(indexquals, rinfo))
+			continue;			/* simple duplicate */
+		if (is_redundant_derived_clause(rinfo, indexquals))
+			continue;			/* derived from same EquivalenceClass */
+		/* ... skip the predicate proof attempt createplan.c will try ... */
+		result = lappend(result, rinfo);
+	}
+	return result;
+}
+
+static void
+cost_structured_index(IndexPath *path, PlannerInfo *root, double loop_count,
+		   bool partial_path)
+{
+	IndexOptInfo *index = path->indexinfo;
+	RelOptInfo *baserel = index->rel;
+	bool		indexonly = (path->path.pathtype == T_IndexOnlyScan);
+	amcostestimate_function amcostestimate;
+	List	   *qpquals;
+	Cost		startup_cost = 0;
+	Cost		run_cost = 0;
+	Cost		cpu_run_cost = 0;
+	Cost		indexStartupCost;
+	Cost		indexTotalCost;
+	Selectivity indexSelectivity;
+	double		indexCorrelation,
+				csquared;
+	double		spc_seq_page_cost,
+				spc_random_page_cost;
+	Cost		min_IO_cost,
+				max_IO_cost;
+	QualCost	qpqual_cost;
+	Cost		cpu_per_tuple;
+	double		tuples_fetched;
+	double		pages_fetched;
+	double		rand_heap_pages;
+	double		index_pages;
+
+	/* Should only be applied to base relations */
+	Assert(IsA(baserel, RelOptInfo) &&
+		   IsA(index, IndexOptInfo));
+	Assert(baserel->relid > 0);
+	Assert(baserel->rtekind == RTE_RELATION);
+
+	/*
+	 * Mark the path with the correct row estimate, and identify which quals
+	 * will need to be enforced as qpquals.  We need not check any quals that
+	 * are implied by the index's predicate, so we can use indrestrictinfo not
+	 * baserestrictinfo as the list of relevant restriction clauses for the
+	 * rel.
+	 */
+	if (path->path.param_info)
+	{
+		path->path.rows = path->path.param_info->ppi_rows;
+		/* qpquals come from the rel's restriction clauses and ppi_clauses */
+		qpquals = list_concat(
+							  extract_nonindex_conditions(path->indexinfo->indrestrictinfo,
+														  path->indexquals),
+							  extract_nonindex_conditions(path->path.param_info->ppi_clauses,
+														  path->indexquals));
+	}
+	else
+	{
+		path->path.rows = baserel->rows;
+		/* qpquals come from just the rel's restriction clauses */
+		qpquals = extract_nonindex_conditions(path->indexinfo->indrestrictinfo,
+											  path->indexquals);
+	}
+
+	if (!enable_indexscan)
+		startup_cost += disable_cost;
+	/* we don't need to check enable_indexonlyscan; indxpath.c does that */
+
+	/*
+	 * Call index-access-method-specific code to estimate the processing cost
+	 * for scanning the index, as well as the selectivity of the index (ie,
+	 * the fraction of main-table tuples we will have to retrieve) and its
+	 * correlation to the main-table tuple order.  We need a cast here because
+	 * relation.h uses a weak function type to avoid including amapi.h.
+	 */
+	amcostestimate = (amcostestimate_function) index->amcostestimate;
+	amcostestimate(root, path, loop_count,
+				   &indexStartupCost, &indexTotalCost,
+				   &indexSelectivity, &indexCorrelation,
+				   &index_pages);
+
+	elog(WARNING, "indexStartupCost: %f, indexTotalCost: %f, indexSelectivity: %f, indexCorrelation: %f, index_pages: %f",
+		 indexStartupCost, indexTotalCost, indexSelectivity, indexCorrelation, index_pages);
+	
+	/*
+	 * Save amcostestimate's results for possible use in bitmap scan planning.
+	 * We don't bother to save indexStartupCost or indexCorrelation, because a
+	 * bitmap scan doesn't care about either.
+	 */
+	path->indextotalcost = indexTotalCost;
+	path->indexselectivity = indexSelectivity;
+
+	/* all costs for touching index itself included here */
+	startup_cost += indexStartupCost;
+	run_cost += indexTotalCost - indexStartupCost;
+
+	/* estimate number of main-table tuples fetched */
+	tuples_fetched = clamp_row_est(indexSelectivity * baserel->tuples);
+
+	/*
+	 * Estimate CPU costs per tuple.
+	 *
+	 * What we want here is cpu_tuple_cost plus the evaluation costs of any
+	 * qual clauses that we have to evaluate as qpquals.
+	 */
+	cost_qual_eval(&qpqual_cost, qpquals, root);
+
+	startup_cost += qpqual_cost.startup;
+	cpu_per_tuple = cpu_tuple_cost + qpqual_cost.per_tuple;
+
+	cpu_run_cost += cpu_per_tuple * tuples_fetched;
+
+	// /* tlist eval costs are paid per output row, not per tuple scanned */
+	// startup_cost += path->path.pathtarget->cost.startup;
+	// cpu_run_cost += path->path.pathtarget->cost.per_tuple * path->path.rows;
+
+	run_cost += cpu_run_cost;
+
+	path->path.startup_cost = startup_cost;
+	path->path.total_cost = startup_cost + run_cost;
+}
+
 static IndexPath *
 create_structured_index_path(PlannerInfo *root,
 							 RelOptInfo *baserel,
@@ -286,18 +426,50 @@ create_structured_index_path(PlannerInfo *root,
 	 * 因此此处只需要创建T_IndexOnlyScan。
 	 */
 	// TODO: 创建路径需要自己实现，pathtarget和代价都要自己计算
-	ipath = create_index_path(root, index,
-							index_clauses,
-							clause_columns,
-							NIL,
-							NIL,
-							useful_pathkeys,
-							ForwardScanDirection,	// ForwardScanDirection
-							false,					// T_IndexScan
-							NULL,
-							1.0,
-							false);
+	// ipath = create_index_path(root, index,
+	// 						index_clauses,
+	// 						clause_columns,
+	// 						NIL,
+	// 						NIL,
+	// 						useful_pathkeys,
+	// 						ForwardScanDirection,	// ForwardScanDirection
+	// 						false,					// T_IndexScan
+	// 						NULL,
+	// 						1.0,
+	// 						false);
 	
+	IndexPath  *pathnode = makeNode(IndexPath);
+	RelOptInfo *rel = index->rel;
+	List	   *indexquals,
+			   *indexqualcols;
+
+	pathnode->path.pathtype = T_IndexScan;
+	pathnode->path.parent = rel;
+	pathnode->path.pathtarget = rel->reltarget;
+	pathnode->path.param_info = get_baserel_parampathinfo(root, rel,
+														  NULL);
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel;
+	pathnode->path.parallel_workers = 0;
+	pathnode->path.pathkeys = useful_pathkeys;
+
+	/* Convert clauses to indexquals the executor can handle */
+	expand_indexqual_conditions(index, index_clauses, clause_columns,
+								&indexquals, &indexqualcols);
+
+	/* Fill in the pathnode */
+	pathnode->indexinfo = index;
+	pathnode->indexclauses = index_clauses;
+	pathnode->indexquals = indexquals;
+	pathnode->indexqualcols = indexqualcols;
+	pathnode->indexorderbys = NIL;
+	pathnode->indexorderbycols = NIL;
+	pathnode->indexscandir = ForwardScanDirection;
+
+	cost_structured_index(pathnode, root, loop_count, false);
+
+	ipath = pathnode;
+
 	/* 
 	 * TODO: 
 	 * 默认ForwardScanDirection，但不确定ForwardScanDirection和BackwardScanDirection的代价是否一样，
@@ -759,10 +931,10 @@ typedef struct PGIVFPQDataTuple
 	uint8 pq_code[128];	
 } PGIVFPQDataTuple;
 
-static Cost
-estimate_hybrid_ivfpq_cost(IndexPath *index_path, Selectivity selectivity)
+static GenericCosts
+estimate_hybrid_ivfpq_cost(IndexPath *path, Selectivity selectivity)
 {
-	IndexOptInfo *index_path = path->indexinfo;
+	IndexOptInfo *index = path->indexinfo;
 	GenericCosts costs;
 
 	/* 
@@ -840,11 +1012,11 @@ estimate_hybrid_ivfpq_cost(IndexPath *index_path, Selectivity selectivity)
 	int32 per_page_pq_ctup_num = (page_sz - page_opaque_sz) / pq_ctup_sz;
 	int32 per_page_dtup_num = (page_sz - page_opaque_sz) / dtup_sz;
 
-	elog(WARNING, "\npage_sz: %d,\npage_opaque_sz: %d,\nivf_ctup_sz: %d,\npq_ctup_sz: %d,\ndtup_sz: %d",
-					page_sz, page_opaque_sz, ivf_ctup_sz, pq_ctup_sz, dtup_sz);
+	// elog(WARNING, "\npage_sz: %d,\npage_opaque_sz: %d,\nivf_ctup_sz: %d,\npq_ctup_sz: %d,\ndtup_sz: %d",
+	// 				page_sz, page_opaque_sz, ivf_ctup_sz, pq_ctup_sz, dtup_sz);
 	
-	elog(WARNING, "\nper_page_ivf_ctup_num: %d,\nper_page_pq_ctup_num: %d,\nper_page_dtup_num: %d",
-					per_page_ivf_ctup_num, per_page_pq_ctup_num, per_page_dtup_num);
+	// elog(WARNING, "\nper_page_ivf_ctup_num: %d,\nper_page_pq_ctup_num: %d,\nper_page_dtup_num: %d",
+	// 				per_page_ivf_ctup_num, per_page_pq_ctup_num, per_page_dtup_num);
 
 	/* IO cost: a. 搜索最近的IVF；b. compute residuals；c. 计算distance_table；d. 扫描IVF。 */
 	io_cnt += ceil((float) ivf_centroid_num / per_page_ivf_ctup_num);
@@ -855,11 +1027,11 @@ estimate_hybrid_ivfpq_cost(IndexPath *index_path, Selectivity selectivity)
 	 */
 	io_cnt += ceil(selectivity * ntotal);
 
-	elog(WARNING, "\nivf io: %d,\nresiduals io: %d,\ndistance tables io: %d,\nscan ivf io: %d",
-					(int32) ceil((float) ivf_centroid_num / per_page_ivf_ctup_num),
-					nprobe,
-					(int32) ceil((float) pq_sub_num / per_page_pq_ctup_num),
-					(int32) ceil((float) nprobe / ivf_centroid_num * ntotal / per_page_dtup_num));
+	// elog(WARNING, "\nivf io: %d,\nresiduals io: %d,\ndistance tables io: %d,\nscan ivf io: %d",
+	// 				(int32) ceil((float) ivf_centroid_num / per_page_ivf_ctup_num),
+	// 				nprobe,
+	// 				(int32) ceil((float) pq_sub_num / per_page_pq_ctup_num),
+	// 				(int32) ceil((float) nprobe / ivf_centroid_num * ntotal / per_page_dtup_num));
 
 	/* CPU cost: a. 搜索最近的IVF（没有CPU cost）；b. compute residuals（没有CPU cost）；c. 计算distance_table（没有CPU cost）；d. 扫描IVF。 */
 	/* FIXME: 现在CPU cost只计算通过distance_table进行距离计算的次数。 */
@@ -879,30 +1051,186 @@ estimate_hybrid_ivfpq_cost(IndexPath *index_path, Selectivity selectivity)
 			   compute_pq_centroid_and_residual_sub_cnt * cost_from_pq_centroid_and_residual_sub + \
 			   compute_dt_distance_cnt * cost_from_dt;
 
-	Cost op_evaluate_cost = DEFAULT_CPU_OPERATOR_COST * 5000.0 * path->path.parent->rows;
-	elog(WARNING, "baserel->rows: %f, op_evaluate_cost: %f", path->path.parent->rows, op_evaluate_cost);
+	// Cost op_evaluate_cost = DEFAULT_CPU_OPERATOR_COST * 5000.0 * path->path.parent->rows;
+	// elog(WARNING, "baserel->rows: %f, op_evaluate_cost: %f", path->path.parent->rows, op_evaluate_cost);
 
-	elog(WARNING, "\nio_cnt: %d, io_cost: %f,"
-				   "\nraw: %d, cost: %f,"
-				   "\npq centroid and residual sub: %d, cost: %f,"
-				   "\ndt: %d, cost: %f,"
-				   "\ncpu_cost: %f",
-		 io_cnt, io_cost,
-		 compute_raw_distance_cnt, compute_raw_distance_cnt * cost_from_raw,
-		 compute_pq_centroid_and_residual_sub_cnt, compute_pq_centroid_and_residual_sub_cnt * cost_from_pq_centroid_and_residual_sub,
-		 compute_dt_distance_cnt, compute_dt_distance_cnt * cost_from_dt,
-		 cpu_cost);
+	// elog(WARNING, "\nio_cnt: %d, io_cost: %f,"
+	// 			   "\nraw: %d, cost: %f,"
+	// 			   "\npq centroid and residual sub: %d, cost: %f,"
+	// 			   "\ndt: %d, cost: %f,"
+	// 			   "\ncpu_cost: %f",
+	// 	 io_cnt, io_cost,
+	// 	 compute_raw_distance_cnt, compute_raw_distance_cnt * cost_from_raw,
+	// 	 compute_pq_centroid_and_residual_sub_cnt, compute_pq_centroid_and_residual_sub_cnt * cost_from_pq_centroid_and_residual_sub,
+	// 	 compute_dt_distance_cnt, compute_dt_distance_cnt * cost_from_dt,
+	// 	 cpu_cost);
 
 	run_cost += numIndexTuples * cpu_index_tuple_cost;
 
-	elog(WARNING, "run_cost: %f", run_cost);
+	// elog(WARNING, "run_cost: %f", run_cost);
 
 	costs.indexStartupCost = io_cost + cpu_cost;
 	costs.indexTotalCost = io_cost + cpu_cost + run_cost;
-	costs.indexSelectivity = min(selectivity, (double) numIndexTuples / ntotal);
+	costs.indexSelectivity = selectivity < ((double) numIndexTuples / ntotal) ? selectivity : ((double) numIndexTuples / ntotal);
+	costs.indexCorrelation = 0.0;
 
+	costs.numIndexPages = io_cnt;
+	costs.numIndexTuples = (selectivity * ntotal) < numIndexTuples ? (selectivity * ntotal) : numIndexTuples;
+	costs.spc_random_page_cost = DEFAULT_SEQ_PAGE_COST;
+	costs.num_sa_scans = 0.0;
 
-	return 
+	return costs;
+}
+
+static GenericCosts
+get_pgivfpq_raw_cost(IndexPath *path)
+{
+	IndexOptInfo *index = path->indexinfo;
+	GenericCosts costs;
+
+	/* 
+	 * IVFPQ算法在搜索过程中，计算向量之间的距离时，有2种向量形式：
+	 * 1. 计算两个原始向量之间的距离（使用情况：搜索最近的IVF。）；
+	 * 2. 计算两个原始向量的pq码之间的距离（使用情况：扫描IVF。有两种方式：通过distance table计算；直接计算。
+	 *    哪种方式速度较快，与底库大小和搜索参数nprobe有关，需要进一步测试。）。
+	 * 3. 计算pq centroid与residual各个子段之间的距离（使用情况：计算distance table。）
+	 * 因此，计算一次两个向量之间的距离，有4种代价参数。
+	 */
+
+	Cost io_cost = 0.0;
+	Cost cpu_cost = 0.0;
+	Cost run_cost = 0.0;
+
+	int32 io_cnt = 0;
+	int32 compute_raw_distance_cnt = 0;
+	// TODO: 在扫描IVF，这里暂时只考虑通过distance table计算这种方式的代价。
+	int32 compute_dt_distance_cnt = 0;
+	// int32 compute_pq_distance_cnt = 0;
+	int32 compute_pq_centroid_and_residual_sub_cnt = 0;
+
+	/* 
+	 * NOTE:
+	 * 现在的代价计算，只能用于与联合查询的向量搜索的代价比较，
+	 * 而不能用于与暴力搜索的代价比较，原因如下：
+	 * 1. 暴力搜索的距离计算（两个feature之间）与向量搜索的距离计算（两个feature的pq码之间），
+	 *    没有在同一操作符下进行比较（可通过设置不同的代价参数解决）；
+	 * 2. 通过向量索引进行搜索时，会计算投影列上的代价，其中包括投影列上的表达式的代价，这里的表达式也包括操作符，
+	 *    操作符表达式的代价即为定义操作符对应的函数时指定的代价（与暴力搜索时的表达式代价一样），
+	 *    这部分代价为set_baserel_size_estimates函数中估计的行数x操作符表达式代价，但这里的函数估计，是从其他表达式中估计出来的，
+	 *    不包括索引对应的表达式（比如一般向量索引会返回TopK个数据，总共TopK行），
+	 *    因此这部分代价的大小是不定的，且不能通过索引扩展估计出来（暂时无法在向量索引的搜索时去掉操作符表达式代价，无法解决）。
+	 * 3. 使用向量索引进行搜索时，ExecProject函数里面会执行操作符对应的函数，但操作符底层的函数，是直接从缓存result_distances中获取结果的，
+	 *    因此操作符表达式的代价在向量索引的搜索中是多估计出来的，如果与暴力搜索的代价比较，
+	 *    会导致不能正确选择较好的查询计划（暂时无法在向量索引的搜索时去掉操作符表达式代价，无法解决）。
+	 */
+
+	/*
+	 * NOTE:
+	 * 1、搜索过程中的最大堆排序的CPU代价暂时忽略；
+	 * 2、搜索过程中的计算residuals的CPU代价暂时忽略；
+	 * 3、搜索过程中打开索引元页的IO代价暂时忽略;
+	 * 4、搜索过程中对查询向量进行解密的代价直接忽略，因为不管哪种方式的搜索方式都需要对查询向量进行解密，但暴力搜索还需要对底库向量进行解密。
+	 */
+
+	/* 
+	 * TODO:
+	 * 1. 获取索引创建的相关参数（dimension、ivf num、pq num、pq centroid num）和索引搜索的相关参数（nprobe）;
+	 * 2. 获取索引数量。
+	 */
+	uint32 ivf_dim;
+	uint32 ivf_centroid_num;
+	uint32 pq_sub_dim;
+	uint32 pq_sub_num;
+	uint32 pq_per_sub_centroid_num;
+
+	ivf_dim = 512;
+	ivf_centroid_num = 512;
+	pq_sub_dim = 4;
+	pq_sub_num = 128;
+	pq_per_sub_centroid_num = 256;
+
+	int32 nprobe = 128;
+	int32 ntotal = 1000000;
+	int32 numIndexTuples = 512;
+
+	Size page_sz = BLCKSZ;
+	Size page_opaque_sz = MAXALIGN(sizeof(PGIVFPQPageOpaqueData));
+	Size ivf_ctup_sz = MAXALIGN(sizeof(PGIVFPQIVFCentroidTuple));
+	Size pq_ctup_sz = MAXALIGN(sizeof(PGIVFPQPQCentroidTuple));
+	Size dtup_sz = MAXALIGN(sizeof(PGIVFPQDataTuple));
+
+	int32 per_page_ivf_ctup_num = (page_sz - page_opaque_sz) / ivf_ctup_sz;
+	int32 per_page_pq_ctup_num = (page_sz - page_opaque_sz) / pq_ctup_sz;
+	int32 per_page_dtup_num = (page_sz - page_opaque_sz) / dtup_sz;
+
+	// elog(WARNING, "\npage_sz: %d,\npage_opaque_sz: %d,\nivf_ctup_sz: %d,\npq_ctup_sz: %d,\ndtup_sz: %d",
+	// 				page_sz, page_opaque_sz, ivf_ctup_sz, pq_ctup_sz, dtup_sz);
+	
+	// elog(WARNING, "\nper_page_ivf_ctup_num: %d,\nper_page_pq_ctup_num: %d,\nper_page_dtup_num: %d",
+	// 				per_page_ivf_ctup_num, per_page_pq_ctup_num, per_page_dtup_num);
+
+	/* IO cost: a. 搜索最近的IVF；b. compute residuals；c. 计算distance_table；d. 扫描IVF。 */
+	io_cnt += ceil((float) ivf_centroid_num / per_page_ivf_ctup_num);
+	io_cnt += nprobe;
+	io_cnt += ceil((float) pq_sub_num / per_page_pq_ctup_num);
+	/* NOTE: 每个IVF的数据量与数据分布有关，因此这里对IVF扫描的IO次数不能确定，这里的估计假设数据是均匀分布的，每个IVF的数据量一致。
+	 * TODO: 在索引元页里面添加对每个IVF的统计信息。
+	 */
+	io_cnt += ceil((float) nprobe / ivf_centroid_num * ntotal / per_page_dtup_num);
+
+	// elog(WARNING, "\nivf io: %d,\nresiduals io: %d,\ndistance tables io: %d,\nscan ivf io: %d",
+	// 				(int32) ceil((float) ivf_centroid_num / per_page_ivf_ctup_num),
+	// 				nprobe,
+	// 				(int32) ceil((float) pq_sub_num / per_page_pq_ctup_num),
+	// 				(int32) ceil((float) nprobe / ivf_centroid_num * ntotal / per_page_dtup_num));
+
+	/* CPU cost: a. 搜索最近的IVF（没有CPU cost）；b. compute residuals（没有CPU cost）；c. 计算distance_table（没有CPU cost）；d. 扫描IVF。 */
+	/* FIXME: 现在CPU cost只计算通过distance_table进行距离计算的次数。 */
+	/* NOTE: 每个IVF的数据量与数据分布有关，因此这里对IVF扫描的IO次数不能确定，这里的估计假设数据是均匀分布的，每个IVF的数据量一致。 */
+	compute_raw_distance_cnt += ivf_centroid_num;
+	compute_pq_centroid_and_residual_sub_cnt += (pq_per_sub_centroid_num * pq_sub_num) * nprobe;
+	compute_dt_distance_cnt += ceil((float) nprobe / ivf_centroid_num * ntotal);
+
+	/* TODO: 获取cost_from_distance_tables */
+	double cost_from_raw = DEFAULT_CPU_OPERATOR_COST * 20.0;
+	// double cost_from_pq = DEFAULT_CPU_OPERATOR_COST * 1000.0;
+	double cost_from_dt = DEFAULT_CPU_OPERATOR_COST * 10.0;
+	double cost_from_pq_centroid_and_residual_sub = DEFAULT_CPU_OPERATOR_COST * 20.0 * ((double) pq_sub_dim / ivf_dim);
+
+	io_cost = io_cnt * DEFAULT_SEQ_PAGE_COST;
+	cpu_cost = compute_raw_distance_cnt * cost_from_raw + \
+			   compute_pq_centroid_and_residual_sub_cnt * cost_from_pq_centroid_and_residual_sub + \
+			   compute_dt_distance_cnt * cost_from_dt;
+
+	// Cost op_evaluate_cost = DEFAULT_CPU_OPERATOR_COST * 5000.0 * path->path.parent->rows;
+	// elog(WARNING, "baserel->rows: %f, op_evaluate_cost: %f", path->path.parent->rows, op_evaluate_cost);
+
+	// elog(WARNING, "\nio_cnt: %d, io_cost: %f,"
+	// 			   "\nraw: %d, cost: %f,"
+	// 			   "\npq centroid and residual sub: %d, cost: %f,"
+	// 			   "\ndt: %d, cost: %f,"
+	// 			   "\ncpu_cost: %f",
+	// 	 io_cnt, io_cost,
+	// 	 compute_raw_distance_cnt, compute_raw_distance_cnt * cost_from_raw,
+	// 	 compute_pq_centroid_and_residual_sub_cnt, compute_pq_centroid_and_residual_sub_cnt * cost_from_pq_centroid_and_residual_sub,
+	// 	 compute_dt_distance_cnt, compute_dt_distance_cnt * cost_from_dt,
+	// 	 cpu_cost);
+
+	run_cost += numIndexTuples * cpu_index_tuple_cost;
+
+	// elog(WARNING, "run_cost: %f", run_cost);
+
+	costs.indexStartupCost = io_cost + cpu_cost;
+	costs.indexTotalCost = io_cost + cpu_cost + run_cost;
+	costs.indexSelectivity = (double) numIndexTuples / ntotal;
+	costs.indexCorrelation = 0.0;
+
+	costs.numIndexPages = io_cnt;
+	costs.numIndexTuples = numIndexTuples;
+	costs.spc_random_page_cost = DEFAULT_SEQ_PAGE_COST;
+	costs.num_sa_scans = 0.0;
+
+	return costs;
 }
 
 static bool
@@ -919,6 +1247,8 @@ find_best_paths(List *structured_index_paths, List *anns_index_paths,
 
 	Selectivity min_selectivity = 1.0;
 	Cost		min_anns_cost = disable_cost;
+	GenericCosts anns_cost;
+	GenericCosts anns_raw_cost;
 
 	/* 
 	 * NOTE:
@@ -946,7 +1276,6 @@ find_best_paths(List *structured_index_paths, List *anns_index_paths,
 	{
 		IndexPath *index_path = (IndexPath *)lfirst(lc);
 		Name amname = GetIndexAmNameByAmOid(index_path->indexinfo->relam, false);
-		Cost anns_cost;
 		if (strcmp("pg_ivfpq", amname->data) == 0)
 		{
 			anns_cost = estimate_hybrid_ivfpq_cost(index_path, min_selectivity);
@@ -956,9 +1285,9 @@ find_best_paths(List *structured_index_paths, List *anns_index_paths,
 			// TODO:
 		}
 
-		if (min_anns_cost > anns_cost)
+		if (min_anns_cost > anns_cost.indexTotalCost)
 		{
-			min_anns_cost = anns_cost;
+			min_anns_cost = anns_cost.indexTotalCost;
 			best_anns_index_path = index_path;
 		}
 	}
@@ -972,18 +1301,25 @@ find_best_paths(List *structured_index_paths, List *anns_index_paths,
 	 * 然后更新联合查询下向量索引的代价即可，PostgreSQL的查询规划模块会
 	 * 自动选择代价最低的路径。
 	 */
-	int32 n = 1000000;
-	int32 ni = 64;
-	not_hybrid_cost = (128.0 / 512.0) * n * cost_from_distance_tables /* cpu cost */ + \
-					  (128.0 / 512.0) * ((float)n / ni) * DEFAULT_SEQ_PAGE_COST /* io cost */;
+	anns_raw_cost = get_pgivfpq_raw_cost(best_anns_index_path);
+
+	elog(WARNING, "structured startup cost: %f, total_cost: %f, anns startup cost: %f, total_cost: %f",
+		 best_structured_index_path->path.startup_cost, best_structured_index_path->path.total_cost,
+		 anns_cost.indexStartupCost, anns_cost.indexTotalCost);
+	elog(WARNING, "hybrid_cost: %f, not_hybrid_cost: %f", hybrid_cost, anns_raw_cost.indexTotalCost);
 	
-	if (hybrid_cost < not_hybrid_cost)
+	if (hybrid_cost < anns_raw_cost.indexTotalCost)
 		use_hybridquery = true;
+
+	// Cost op_evaluate_cost = DEFAULT_CPU_OPERATOR_COST * 5000.0 * best_anns_index_path->path.parent->rows;
+	// elog(WARNING, "baserel->rows: %f, op_evaluate_cost: %f", best_anns_index_path->path.parent->rows, op_evaluate_cost);
 	
 	/* 更新联合查询下向量索引的代价 */
-
-	best_anns_index_path->indextotalcost = min_anns_cost;
-	// best_anns_index_path->indextotalcost = 0.0;
+	best_anns_index_path->path.rows = anns_cost.numIndexTuples;
+	best_anns_index_path->indextotalcost = anns_cost.indexTotalCost;
+	best_anns_index_path->indexselectivity = anns_cost.indexSelectivity;
+	best_anns_index_path->path.startup_cost = anns_cost.indexStartupCost;
+	best_anns_index_path->path.total_cost = anns_cost.indexTotalCost;
 
 	/* 
 	 * NOTE:
@@ -994,6 +1330,24 @@ find_best_paths(List *structured_index_paths, List *anns_index_paths,
 	*p_best_anns_index_path = best_anns_index_path;
 
 	return use_hybridquery;
+}
+
+static void
+estimate_hybridquery_io_cost(RelOptInfo *baserel, CustomPath *cpath)
+{
+	Cost		run_cost = 0;
+	double		spc_seq_page_cost,
+				spc_random_page_cost;
+
+	/* fetch estimated page costs for tablespace containing table */
+	get_tablespace_page_costs(baserel->reltablespace,
+							  &spc_random_page_cost,
+							  &spc_seq_page_cost);
+
+	// 简单处理
+	run_cost += cpath->path.rows * spc_random_page_cost;
+
+	cpath->path.total_cost += run_cost;
 }
 
 /*
@@ -1064,9 +1418,15 @@ set_hybridquery_path(PlannerInfo *root, RelOptInfo *baserel,
 	cpath->path.parallel_workers = 0;
 
 	// TODO: 待确认startup_cost和total_cost这样设置是否正确
-	cpath->path.rows = 512;  // TODO: be fixed to 512 now and to be fixed later.
-	cpath->path.startup_cost = best_structured_index_path->indextotalcost + best_anns_index_path->indextotalcost;
-	cpath->path.total_cost = best_anns_index_path->indextotalcost;
+	// cpath->path.rows = 512;  // TODO: be fixed to 512 now and to be fixed later.
+	double est_rows = best_structured_index_path->indexselectivity * baserel->tuples;
+	cpath->path.rows = est_rows < 512 ? est_rows : 512;
+	elog(WARNING, "cpath->path.rows: %f", cpath->path.rows);
+	Cost op_evaluate_cost = DEFAULT_CPU_OPERATOR_COST * 5000.0 * cpath->path.rows;
+	elog(WARNING, "cpath->path.rows: %f, op_evaluate_cost: %f", cpath->path.rows, op_evaluate_cost);
+	cpath->path.startup_cost = best_structured_index_path->path.total_cost + best_anns_index_path->path.total_cost;
+	cpath->path.total_cost = best_structured_index_path->path.total_cost + best_anns_index_path->path.total_cost - op_evaluate_cost;  // 预先减去操作符表达式的代价
+	estimate_hybridquery_io_cost(baserel, cpath);
 	// cpath->path.startup_cost = 0.0;
 	// cpath->path.total_cost = 0.0;
 
