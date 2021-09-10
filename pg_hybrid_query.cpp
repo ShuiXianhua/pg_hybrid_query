@@ -56,75 +56,30 @@ extern "C"
 
 PG_MODULE_MAGIC;
 
-/*
- * HybridQueryState
- */
-typedef struct {
-	CustomScanState		css;
-} HybridQueryState;
+static set_rel_pathlist_hook_type	set_rel_pathlist_next;
+static bool							enable_hybridquery;
 
-/* static variables */
-static bool		enable_hybridquery;
-static set_rel_pathlist_hook_type set_rel_pathlist_next = NULL;
+/* cost parameters */
+// TODO: 有哪些代价参数；代价参数命名（取个好名字）
 double cost_from_distance_tables;
 double cost_from_two_codes;
 
-/* function declarations */
-void _PG_init(void);
-void _PG_fini(void);
+/* methods of custom-scan callbacks */
+static CustomPathMethods hybridquery_path_methods;
+static CustomScanMethods hybridquery_scan_methods;
+static CustomExecMethods hybridquery_exec_methods;
 
-static void set_hybridquery_path(PlannerInfo *root,
-							RelOptInfo *rel,
-							Index rti,
-							RangeTblEntry *rte);
+/*
+ * HybridQueryState
+ */
+// TODO: 根据实际使用情况，考虑是否需要再封装一层。（要看使用过程中是否有自定义的数据结构需要保存）
+typedef struct
+{
+	CustomScanState css;
+} HybridQueryState;
 
-/* CustomPathMethods */
-static Plan *PlanHybridQueryPath(PlannerInfo *root,
-							  RelOptInfo *rel,
-							  CustomPath *best_path,
-							  List *tlist,
-							  List *clauses,
-							  List *custom_plans);
 
-/* CustomScanMethods */
-static Node *CreateHybridQueryScanState(CustomScan *custom_plan);
-
-/* CustomScanExecMethods */
-static void BeginHybridQueryScan(CustomScanState *node, EState *estate, int eflags);
-static TupleTableSlot *ExecHybridQueryScan(CustomScanState *node);
-static void EndHybridQueryScan(CustomScanState *node);
-static void ReScanHybridQueryScan(CustomScanState *node);
-static void ExplainHybridQueryScan(CustomScanState *node, List *ancestors,
-							ExplainState *es);
-
-/* static table of custom-scan callbacks */
-static CustomPathMethods	hybridquery_path_methods = {
-	"hybridquery",				/* CustomName */
-	PlanHybridQueryPath,		/* PlanCustomPath */
-	NULL,						/* ReparameterizeCustomPathByChild */
-};
-
-static CustomScanMethods	hybridquery_scan_methods = {
-	"hybridquery",				/* CustomName */
-	CreateHybridQueryScanState,	/* CreateCustomScanState */
-};
-
-static CustomExecMethods	hybridquery_exec_methods = {
-	"hybridquery",				/* CustomName */
-	BeginHybridQueryScan,			/* BeginCustomScan */
-	ExecHybridQueryScan,			/* ExecCustomScan */
-	EndHybridQueryScan,			/* EndCustomScan */
-	ReScanHybridQueryScan,			/* ReScanCustomScan */
-	NULL,					/* MarkPosCustomScan */
-	NULL,					/* RestrPosCustomScan */
-	NULL,					/* EstimateDSMCustomScan */
-	NULL,					/* InitializeDSMCustomScan */
-	NULL,					/* ReInitializeDSMCustomScan */
-	NULL,					/* InitializeWorkerCustomScan */
-	NULL,					/* ShutdownCustomScan */
-	ExplainHybridQueryScan,		/* ExplainCustomScan */
-};
-
+// TODO: 从内核移植过来的函数需要的数据结构
 /* Data structure for collecting qual clauses that match an index */
 typedef struct
 {
@@ -375,6 +330,7 @@ cost_structured_index(IndexPath *path, PlannerInfo *root, double loop_count,
 	path->path.total_cost = startup_cost + run_cost;
 }
 
+// TODO: 重构
 static IndexPath *
 create_structured_index_path(PlannerInfo *root,
 							 RelOptInfo *baserel,
@@ -479,6 +435,281 @@ create_structured_index_path(PlannerInfo *root,
 	return ipath;
 }
 
+/*
+ * match_clause_to_indexcol()
+ *	  Determines whether a restriction clause matches a column of an index.
+ *
+ *	  To match an index normally, the clause:
+ *
+ *	  (1)  must be in the form (indexkey op const) or (const op indexkey);
+ *		   and
+ *	  (2)  must contain an operator which is in the same family as the index
+ *		   operator for this column, or is a "special" operator as recognized
+ *		   by match_special_index_operator();
+ *		   and
+ *	  (3)  must match the collation of the index, if collation is relevant.
+ *
+ *	  Our definition of "const" is exceedingly liberal: we allow anything that
+ *	  doesn't involve a volatile function or a Var of the index's relation.
+ *	  In particular, Vars belonging to other relations of the query are
+ *	  accepted here, since a clause of that form can be used in a
+ *	  parameterized indexscan.  It's the responsibility of higher code levels
+ *	  to manage restriction and join clauses appropriately.
+ *
+ *	  Note: we do need to check for Vars of the index's relation on the
+ *	  "const" side of the clause, since clauses like (a.f1 OP (b.f2 OP a.f3))
+ *	  are not processable by a parameterized indexscan on a.f1, whereas
+ *	  something like (a.f1 OP (b.f2 OP c.f3)) is.
+ *
+ *	  Presently, the executor can only deal with indexquals that have the
+ *	  indexkey on the left, so we can only use clauses that have the indexkey
+ *	  on the right if we can commute the clause to put the key on the left.
+ *	  We do not actually do the commuting here, but we check whether a
+ *	  suitable commutator operator is available.
+ *
+ *	  If the index has a collation, the clause must have the same collation.
+ *	  For collation-less indexes, we assume it doesn't matter; this is
+ *	  necessary for cases like "hstore ? text", wherein hstore's operators
+ *	  don't care about collation but the clause will get marked with a
+ *	  collation anyway because of the text argument.  (This logic is
+ *	  embodied in the macro IndexCollMatchesExprColl.)
+ *
+ *	  It is also possible to match RowCompareExpr clauses to indexes (but
+ *	  currently, only btree indexes handle this).  In this routine we will
+ *	  report a match if the first column of the row comparison matches the
+ *	  target index column.  This is sufficient to guarantee that some index
+ *	  condition can be constructed from the RowCompareExpr --- whether the
+ *	  remaining columns match the index too is considered in
+ *	  adjust_rowcompare_for_index().
+ *
+ *	  It is also possible to match ScalarArrayOpExpr clauses to indexes, when
+ *	  the clause is of the form "indexkey op ANY (arrayconst)".
+ *
+ *	  For boolean indexes, it is also possible to match the clause directly
+ *	  to the indexkey; or perhaps the clause is (NOT indexkey).
+ *
+ * 'index' is the index of interest.
+ * 'indexcol' is a column number of 'index' (counting from 0).
+ * 'rinfo' is the clause to be tested (as a RestrictInfo node).
+ *
+ * Returns true if the clause can be used with this index key.
+ *
+ * NOTE:  returns false if clause is an OR or AND clause; it is the
+ * responsibility of higher-level routines to cope with those.
+ */
+static bool
+match_clause_to_indexcol(IndexOptInfo *index,
+						 int indexcol,
+						 RestrictInfo *rinfo)
+{
+	Expr	   *clause = rinfo->clause;
+	Index		index_relid = index->rel->relid;
+	Oid			opfamily;
+	Oid			idxcollation;
+	Node	   *leftop,
+			   *rightop;
+	Relids		left_relids;
+	Relids		right_relids;
+	Oid			expr_op;
+	Oid			expr_coll;
+	bool		plain_op;
+
+	Assert(indexcol < index->nkeycolumns);
+
+	opfamily = index->opfamily[indexcol];
+	idxcollation = index->indexcollations[indexcol];
+
+	/* First check for boolean-index cases. */
+	if (IsBooleanOpfamily(opfamily))
+	{
+		if (match_boolean_index_clause((Node *) clause, indexcol, index))
+			return true;
+	}
+
+	/*
+	 * Clause must be a binary opclause, or possibly a ScalarArrayOpExpr
+	 * (which is always binary, by definition).  Or it could be a
+	 * RowCompareExpr, which we pass off to match_rowcompare_to_indexcol().
+	 * Or, if the index supports it, we can handle IS NULL/NOT NULL clauses.
+	 */
+	if (is_opclause(clause))
+	{
+		leftop = get_leftop(clause);
+		rightop = get_rightop(clause);
+		if (!leftop || !rightop)
+			return false;
+		left_relids = rinfo->left_relids;
+		right_relids = rinfo->right_relids;
+		expr_op = ((OpExpr *) clause)->opno;
+		expr_coll = ((OpExpr *) clause)->inputcollid;
+		plain_op = true;
+	}
+	else if (clause && IsA(clause, ScalarArrayOpExpr))
+	{
+		ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
+
+		/* We only accept ANY clauses, not ALL */
+		if (!saop->useOr)
+			return false;
+		leftop = (Node *) linitial(saop->args);
+		rightop = (Node *) lsecond(saop->args);
+		left_relids = NULL;		/* not actually needed */
+		right_relids = pull_varnos(rightop);
+		expr_op = saop->opno;
+		expr_coll = saop->inputcollid;
+		plain_op = false;
+	}
+	else if (clause && IsA(clause, RowCompareExpr))
+	{
+		return match_rowcompare_to_indexcol(index, indexcol,
+											opfamily, idxcollation,
+											(RowCompareExpr *) clause);
+	}
+	else if (index->amsearchnulls && IsA(clause, NullTest))
+	{
+		NullTest   *nt = (NullTest *) clause;
+
+		if (!nt->argisrow &&
+			match_index_to_operand((Node *) nt->arg, indexcol, index))
+			return true;
+		return false;
+	}
+	else
+		return false;
+
+	/*
+	 * Check for clauses of the form: (indexkey operator constant) or
+	 * (constant operator indexkey).  See above notes about const-ness.
+	 */
+	if (match_index_to_operand(leftop, indexcol, index) &&
+		!bms_is_member(index_relid, right_relids) &&
+		!contain_volatile_functions(rightop))
+	{
+		if (IndexCollMatchesExprColl(idxcollation, expr_coll) &&
+			is_indexable_operator(expr_op, opfamily, true))
+			return true;
+
+		/*
+		 * If we didn't find a member of the index's opfamily, see whether it
+		 * is a "special" indexable operator.
+		 */
+		if (plain_op &&
+			match_special_index_operator(clause, opfamily,
+										 idxcollation, true))
+			return true;
+		return false;
+	}
+
+	if (plain_op &&
+		match_index_to_operand(rightop, indexcol, index) &&
+		!bms_is_member(index_relid, left_relids) &&
+		!contain_volatile_functions(leftop))
+	{
+		if (IndexCollMatchesExprColl(idxcollation, expr_coll) &&
+			is_indexable_operator(expr_op, opfamily, false))
+			return true;
+
+		/*
+		 * If we didn't find a member of the index's opfamily, see whether it
+		 * is a "special" indexable operator.
+		 */
+		if (match_special_index_operator(clause, opfamily,
+										 idxcollation, false))
+			return true;
+		return false;
+	}
+
+	return false;
+}
+
+/*
+ * match_clause_to_index
+ *	  Test whether a qual clause can be used with an index.
+ *
+ * If the clause is usable, add it to the appropriate list in *clauseset.
+ * *clauseset must be initialized to zeroes before first call.
+ *
+ * Note: in some circumstances we may find the same RestrictInfos coming from
+ * multiple places.  Defend against redundant outputs by refusing to add a
+ * clause twice (pointer equality should be a good enough check for this).
+ *
+ * Note: it's possible that a badly-defined index could have multiple matching
+ * columns.  We always select the first match if so; this avoids scenarios
+ * wherein we get an inflated idea of the index's selectivity by using the
+ * same clause multiple times with different index columns.
+ */
+static void
+match_clause_to_index(IndexOptInfo *index,
+					  RestrictInfo *rinfo,
+					  IndexClauseSet *clauseset)
+{
+	int			indexcol;
+
+	/*
+	 * Never match pseudoconstants to indexes.  (Normally a match could not
+	 * happen anyway, since a pseudoconstant clause couldn't contain a Var,
+	 * but what if someone builds an expression index on a constant? It's not
+	 * totally unreasonable to do so with a partial index, either.)
+	 */
+	if (rinfo->pseudoconstant)
+		return;
+
+	/*
+	 * If clause can't be used as an indexqual because it must wait till after
+	 * some lower-security-level restriction clause, reject it.
+	 */
+	if (!restriction_is_securely_promotable(rinfo, index->rel))
+		return;
+
+	/* OK, check each index key column for a match */
+	for (indexcol = 0; indexcol < index->nkeycolumns; indexcol++)
+	{
+		if (match_clause_to_indexcol(index,
+									 indexcol,
+									 rinfo))
+		{
+			clauseset->indexclauses[indexcol] =
+				list_append_unique_ptr(clauseset->indexclauses[indexcol],
+									   rinfo);
+			clauseset->nonempty = true;
+			return;
+		}
+	}
+}
+
+/*
+ * match_clauses_to_index
+ *	  Perform match_clause_to_index() for each clause in a list.
+ *	  Matching clauses are added to *clauseset.
+ */
+static void
+match_clauses_to_index(IndexOptInfo *index,
+					   List *clauses,
+					   IndexClauseSet *clauseset)
+{
+	ListCell   *lc;
+
+	foreach(lc, clauses)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+		match_clause_to_index(index, rinfo, clauseset);
+	}
+}
+
+/*
+ * match_restriction_clauses_to_index
+ *	  Identify restriction clauses for the rel that match the index.
+ *	  Matching clauses are added to *clauseset.
+ */
+static void
+match_restriction_clauses_to_index(RelOptInfo *rel, IndexOptInfo *index,
+								   IndexClauseSet *clauseset)
+{
+	/* We can ignore clauses that are implied by the index predicate */
+	match_clauses_to_index(index, index->indrestrictinfo, clauseset);
+}
+
 static List *
 find_structured_index_paths(PlannerInfo *root,
 							RelOptInfo *baserel)
@@ -498,25 +729,28 @@ find_structured_index_paths(PlannerInfo *root,
 		IndexClauseSet	 clauseset;
 		int				 indrestrictcols = 0;
 
-		/* Protect limited-size array in IndexClauseSets */
 		Assert(index->ncolumns <= INDEX_MAX_KEYS);
 
 		/* Ignore partial indexes that do not match the query. */
 		if (index->indpred != NIL && !index->predOK)
 			continue;
 
-		/* NOTE: 现在只处理创建了btree索引的结构化条件。 */
+		/* 
+		 * NOTE: 对于结构化条件，现在只考虑创建了btree索引的结构化条件。
+		 */
 		if (index->relam != BTREE_AM_OID)
 			continue;
 
-		MemSet(&clauseset, 0, sizeof(clauseset));
+		MemSet(&clauseset, 0, sizeof(IndexClauseSet));
 
 		/* 
-		 * 对于一个非局部索引（non-partial index），
+		 * 对于一个非局部索引（non-partial index），即indpred==NIL，
 		 * 每个IndexOptInfo里面的indrestrictinfo成员和
 		 * RelOptInfo的baserestrictinfo成员都指向同一个值，
-		 * 表示RelOptInfo上非连接的约束条件。
+		 * 表示RelOptInfo上非连接的约束条件（check_index_predicates函数中设置）。
 		 */
+		// TODO: 内核中有match_restriction_clauses_to_index->match_clauses_to_index->match_clause_to_index调用栈完成这段foreach代码的功能，
+		//		 直接调用match_restriction_clauses_to_index还是重构，需要进行仔细检查。
 		foreach (rcell, index->indrestrictinfo)
 		{
 			RestrictInfo *rinfo = lfirst_node(RestrictInfo, rcell);
@@ -533,6 +767,7 @@ find_structured_index_paths(PlannerInfo *root,
 
 			simple_match_clause_to_index(index, rinfo, &clauseset);
 		}
+		
 		if (!clauseset.nonempty)
 			continue;
 		
@@ -562,7 +797,7 @@ find_structured_index_paths(PlannerInfo *root,
 	((idxcollation) == InvalidOid || (idxcollation) == (exprcollation))
 
 static Expr *
-hybridquery_match_clause_to_ordering_op(IndexOptInfo *index,
+simple_match_clause_to_ordering_op(IndexOptInfo *index,
 							int indexcol,
 							Expr *clause,
 							Oid pk_opfamily)
@@ -650,7 +885,7 @@ hybridquery_match_clause_to_ordering_op(IndexOptInfo *index,
 }
 
 static void
-hybridquery_match_pathkeys_to_index(IndexOptInfo *index, List *pathkeys,
+simple_match_pathkeys_to_index(IndexOptInfo *index, List *pathkeys,
 						List **orderby_clauses_p,
 						List **clause_columns_p)
 {
@@ -714,7 +949,7 @@ hybridquery_match_pathkeys_to_index(IndexOptInfo *index, List *pathkeys,
 			{
 				Expr	   *expr;
 
-				expr = hybridquery_match_clause_to_ordering_op(index,
+				expr = simple_match_clause_to_ordering_op(index,
 												   indexcol,
 												   member->em_expr,
 												   pathkey->pk_opfamily);
@@ -751,8 +986,8 @@ GetIndexAmNameByAmOid(Oid amoid, bool noerror)
 	{
 		if (noerror)
 			return NULL;
-		elog(ERROR, "cache lookup failed for access method %u",
-			 amoid);
+		
+		elog(ERROR, "cache lookup failed for access method %u", amoid);
 	}
 	amform = (Form_pg_am)GETSTRUCT(tuple);
 
@@ -764,6 +999,7 @@ GetIndexAmNameByAmOid(Oid amoid, bool noerror)
 			ReleaseSysCache(tuple);
 			return NULL;
 		}
+
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("access method \"%s\" is not of type %s",
@@ -787,8 +1023,11 @@ GetIndexAmOidByAmName(const char *amname)
 	if (!HeapTupleIsValid(tuple))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				errmsg("access method \"%s\" does not exist", amname)));
+				 errmsg("access method \"%s\" does not exist", amname)));
+	
 	amoid = HeapTupleGetOid(tuple);
+
+	ReleaseSysCache(tuple);
 
 	return amoid;
 }
@@ -810,6 +1049,7 @@ is_anns_index(Oid amoid)
 		return false;
 }
 
+// TODO: 创建路径需要自己实现，pathtarget和代价都要自己计算
 static IndexPath *
 create_anns_index_path(PlannerInfo *root,
 					   IndexOptInfo *index,
@@ -867,42 +1107,20 @@ find_anns_index_paths(PlannerInfo *root,
 			continue;
 
 		/* see if we can generate ordering operators for query_pathkeys */
-		hybridquery_match_pathkeys_to_index(index, root->query_pathkeys,
-								&orderbyclauses,
-								&orderbyclausecols);
+		// TODO: 重构
+		simple_match_pathkeys_to_index(index, root->query_pathkeys,
+									   &orderbyclauses,
+									   &orderbyclausecols);
 		if (orderbyclauses == NIL || \
 			orderbyclausecols == NIL)
 			continue;
 		
-		// TODO: 创建路径需要自己实现，pathtarget和代价都要自己计算
 		index_path = create_anns_index_path(root, index, orderbyclauses, orderbyclausecols);
 		index_paths = lappend(index_paths, index_path);
 	}
 
 	return index_paths;
 }
-
-// static void
-// estimate_cost_for_ivfpq(IndexPath *best_structured_index_path, IndexPath *best_anns_index_path,
-// 						Cost *hybrid_cost, Cost *not_hybrid_cost)
-// {
-// 	/* 向量索引+结构化过滤的代价 */
-// 	int32 n = 1000000;
-// 	int32 ni = 64;
-// 	Cost anns_structured_cost;
-// 	Cost structured_anns_cost;
-// 	anns_structured_cost = (128.0 / 512.0) * n * cost_from_distance_tables;
-// 	structured_anns_cost = best_structured_index_path->indextotalcost + best_selectivity * n * cost_from_distance_tables;
-
-// 	/* 结构化+向量索引的代价 */
-// 	Cost anns_structured_anns_io_cost;
-// 	Cost structured_anns_anns_io_cost;
-// 	anns_structured_anns_io_cost = (128.0 / 512.0) * ((float)n / ni) * DEFAULT_SEQ_PAGE_COST;
-// 	structured_anns_anns_io_cost = best_selectivity * n * DEFAULT_RANDOM_PAGE_COST;
-
-// 	anns_structured_cost += anns_structured_anns_io_cost;
-// 	structured_anns_cost += structured_anns_anns_io_cost;
-// }
 
 typedef struct PGIVFPQPageOpaqueData
 {
@@ -1237,6 +1455,10 @@ static bool
 find_best_paths(List *structured_index_paths, List *anns_index_paths,
 				IndexPath **p_best_structured_index_path, IndexPath **p_best_anns_index_path)
 {
+	/* 
+	 * 1. 选择selectivity最低结构化索引；
+	 * 2. 根据结构化索引的selectivity计算向量索引的代价，并选择cost最低的向量索引（现阶段只有IVFPQ索引支持联合查询）。
+	 */
 	bool		 use_hybridquery = false;
 	IndexPath	*best_structured_index_path = NULL;
 	IndexPath	*best_anns_index_path = NULL;
@@ -1271,7 +1493,7 @@ find_best_paths(List *structured_index_paths, List *anns_index_paths,
 	 * 需要根据结构化索引的选择率来判断，比如pg_ivfpq索引的搜索能够通过结构化索引
 	 * 进行加速，但是pg_hnsw索引的搜索很难通过结构化索引进行加速。
 	 */
-	
+	// TODO: 重构
 	foreach (lc, anns_index_paths)
 	{
 		IndexPath *index_path = (IndexPath *)lfirst(lc);
@@ -1292,6 +1514,7 @@ find_best_paths(List *structured_index_paths, List *anns_index_paths,
 		}
 	}
 
+	// TODO: 非联合查询的代价是否要计算
 	hybrid_cost = best_structured_index_path->indextotalcost + min_anns_cost;
 	/* 
 	 * TODO:
@@ -1355,14 +1578,14 @@ estimate_hybridquery_io_cost(RelOptInfo *baserel, CustomPath *cpath)
  */
 static void
 set_hybridquery_path(PlannerInfo *root, RelOptInfo *baserel,
-				Index rtindex, RangeTblEntry *rte)
+					 Index rtindex, RangeTblEntry *rte)
 {
 	CustomPath	*cpath;
 	List		*structured_index_paths;
 	List		*anns_index_paths;
-	// NOTE: 如果进行联合查询，向量索引肯定是最后执行的。
 	IndexPath	*best_structured_index_path = NULL;
 	IndexPath	*best_anns_index_path = NULL;
+	// TODO: 是否需要
 	bool		 use_hybridquery;
 
 	/* 
@@ -1370,8 +1593,7 @@ set_hybridquery_path(PlannerInfo *root, RelOptInfo *baserel,
 	 * 1. 从原始表查询；
 	 * 2. 联合查询开启；
 	 * 3. 查询能使用结构化索引；
-	 * 4. 查询能使用向量索引；
-	 * 5. 联合查询的代价比非联合查询的代价低。
+	 * 4. 查询能使用向量索引。
 	 */
 
 	// 1. 从原始表查询
@@ -1379,7 +1601,7 @@ set_hybridquery_path(PlannerInfo *root, RelOptInfo *baserel,
 		rte->rtekind != RTE_RELATION)
 		return;
 
-	// 2. 联合查询开启；
+	// 2. 联合查询开启
 	if (!enable_hybridquery)
 		return;
 	
@@ -1402,6 +1624,7 @@ set_hybridquery_path(PlannerInfo *root, RelOptInfo *baserel,
 	if (!use_hybridquery)
 		elog(INFO, "Cost of hybrid query is greater than cost of ANNS + Filter");
 
+	// TODO: CustomPath构造，重构
 	// 填充CustomPath数据结构，并将best_structured_path和best_anns_path放到CustomPath中。
 	cpath = makeNode(CustomPath);
 	cpath->path.pathtype = T_CustomScan;
@@ -1427,6 +1650,7 @@ set_hybridquery_path(PlannerInfo *root, RelOptInfo *baserel,
 	cpath->path.startup_cost = best_structured_index_path->path.total_cost + best_anns_index_path->path.total_cost;
 	cpath->path.total_cost = best_structured_index_path->path.total_cost + best_anns_index_path->path.total_cost - op_evaluate_cost;  // 预先减去操作符表达式的代价
 	estimate_hybridquery_io_cost(baserel, cpath);
+	// TODO: hash查找的代价
 	// cpath->path.startup_cost = 0.0;
 	// cpath->path.total_cost = 0.0;
 
@@ -2255,6 +2479,7 @@ PlanHybridQueryPath(PlannerInfo *root,
 	/* 
 	 * 结构化索引对应的查询计划
 	 */
+	// TODO: 重构
 	structured_is = (IndexScan *)create_structured_is_plan(root, structured_ipath, tlist);
 
 	/* 
@@ -2264,6 +2489,7 @@ PlanHybridQueryPath(PlannerInfo *root,
 	 * 自定义查询计划会先执行结构化索引对应的查询计划，再将其输出传给向量索引对应的查询计划，此后，
 	 * 自定义查询计划的实际工作者就变成了向量索引对应的查询计划，完成查询，投影，条件过滤，排序等功能。
 	 */
+	// TODO: 重构
 	anns_is = (IndexScan *)create_anns_is_plan(root, anns_ipath, tlist, clauses);
 
 	/* 
@@ -2271,6 +2497,7 @@ PlanHybridQueryPath(PlannerInfo *root,
 	 * NOTE:
 	 * CustomScan->scan.plan中的大部分内容从向量索引对应的查询计划得到。
 	 */
+	// TODO: 重构
 	cscan = create_customscan_plan(structured_is, anns_is);
 
 	return &cscan->scan.plan;  // 其实就是返回CustomScan的指针，只是为了达到类似C++的多态效果
@@ -2282,6 +2509,7 @@ PlanHybridQueryPath(PlannerInfo *root,
 static Node *
 CreateHybridQueryScanState(CustomScan *custom_plan)
 {
+	// TODO: 仔细检查功能是否完善
 	HybridQueryState  *hqs = (HybridQueryState *)palloc0(sizeof(HybridQueryState));
 
 	NodeSetTag(hqs, T_CustomScanState);
@@ -2771,6 +2999,7 @@ BeginHybridQueryScan(CustomScanState *css, EState *estate, int eflags)
 	IndexScanState		*structured_iss;
 	IndexScanState		*anns_iss;
 
+	// TODO: 重构。仔细检查每一步是否正确，功能是否完善
 	structured_iss = init_structured_iss((IndexScan *)hqs->css.ss.ps.plan->lefttree,
 										   estate, eflags);
 	anns_iss = init_anns_iss((IndexScan *)hqs->css.ss.ps.plan->righttree,
@@ -2831,6 +3060,7 @@ ExecStructuredIndexScan(IndexScanState *structured_iss,
 static TupleTableSlot *
 HybridQueryAccess(CustomScanState *css)
 {
+	// TODO: 重构
 	HybridQueryState	*hqs = (HybridQueryState *)css;
 	PlanState			*outerNode;
 	PlanState			*innerNode;
@@ -2963,7 +3193,7 @@ HybridQueryAccess(CustomScanState *css)
 static bool
 HybridQueryRecheck(CustomScanState *node, TupleTableSlot *slot)
 {
-	// TODO:
+	// TODO: 实现
 	return true;
 }
 
@@ -2973,6 +3203,7 @@ HybridQueryRecheck(CustomScanState *node, TupleTableSlot *slot)
 static TupleTableSlot *
 ExecHybridQueryScan(CustomScanState *node)
 {
+	// TODO: 检查此处直接调用ExecScan是否存在冗余的步骤。
 	// accessMtd的执行方式与IndexNext函数相同，只是添加了对Filter的处理。（其实就是从IndexNext函数改写而来，如果不处理Filter，则执行过程与IndexNext函数完全相同）
 	// 1. accessMtd参数所指向的函数中，添加对Filter的处理，得到结构化条件的结果，然后将结构化条件得到的结果传入scandesc的opaque中，
 	//    在向量搜索扩展中会对opaque中的结构化条件的结果进行处理；
@@ -2988,6 +3219,7 @@ ExecHybridQueryScan(CustomScanState *node)
 static void
 EndHybridQueryScan(CustomScanState *node)
 {
+	// TODO: 仔细检查功能是否完善，以及每一步的操作是否正确，是否会产生异常。
 	HybridQueryState *hqs = (HybridQueryState *)node;
 
 	PlanState			*outerNode;
@@ -3009,6 +3241,7 @@ EndHybridQueryScan(CustomScanState *node)
 static void
 ReScanHybridQueryScan(CustomScanState *node)
 {
+	// TODO: 仔细检查功能是否完善，以及每一步的操作是否正确，是否会产生异常。
 	HybridQueryState *hqs = (HybridQueryState *)node;
 
 	PlanState			*outerNode;
@@ -3028,7 +3261,7 @@ ReScanHybridQueryScan(CustomScanState *node)
 static void
 ExplainHybridQueryScan(CustomScanState *node, List *ancestors, ExplainState *es)
 {
-	// TODO:
+	// TODO: 实现
 	return;
 }
 
@@ -3038,6 +3271,7 @@ ExplainHybridQueryScan(CustomScanState *node, List *ancestors, ExplainState *es)
 void
 _PG_init(void)
 {
+	// TODO: GUC参数命名以及description添加（取个好名字，写个好description）
 	DefineCustomBoolVariable("enable_hybridquery",
 							 "Enables the planner's use of hybrid-query plans.",
 							 NULL,
@@ -3071,6 +3305,34 @@ _PG_init(void)
 							 GUC_NOT_IN_SAMPLE,
 							 NULL, NULL, NULL);
 
+	/* path methods */
+	memset(&hybridquery_path_methods, 0, sizeof(CustomPathMethods));
+	hybridquery_path_methods.CustomName = "HybridQuery";
+	hybridquery_path_methods.PlanCustomPath = PlanHybridQueryPath;
+	hybridquery_path_methods.ReparameterizeCustomPathByChild = NULL;
+
+	/* scan methods */
+	memset(&hybridquery_scan_methods, 0, sizeof(CustomScanMethods));
+	hybridquery_scan_methods.CustomName = "HybridQuery";
+	hybridquery_scan_methods.CreateCustomScanState = CreateHybridQueryScanState;
+	RegisterCustomScanMethods(&hybridquery_scan_methods);
+
+	/* exec methods */
+	memset(&hybridquery_exec_methods, 0, sizeof(CustomExecMethods));
+	hybridquery_exec_methods.CustomName = "HybridQuery";
+	hybridquery_exec_methods.BeginCustomScan = BeginHybridQueryScan;
+	hybridquery_exec_methods.ExecCustomScan = ExecHybridQueryScan;
+	hybridquery_exec_methods.EndCustomScan = EndHybridQueryScan;
+	hybridquery_exec_methods.ReScanCustomScan = ReScanHybridQueryScan;
+	hybridquery_exec_methods.MarkPosCustomScan = NULL;
+	hybridquery_exec_methods.RestrPosCustomScan = NULL;
+	hybridquery_exec_methods.EstimateDSMCustomScan = NULL;
+	hybridquery_exec_methods.InitializeDSMCustomScan = NULL;
+	hybridquery_exec_methods.ReInitializeDSMCustomScan = NULL;
+	hybridquery_exec_methods.InitializeWorkerCustomScan = NULL;
+	hybridquery_exec_methods.ShutdownCustomScan = NULL;
+	hybridquery_exec_methods.ExplainCustomScan = ExplainHybridQueryScan;
+
 	/* registration of the hook to add alternative path */
 	set_rel_pathlist_next = set_rel_pathlist_hook;
 	set_rel_pathlist_hook = set_hybridquery_path;
@@ -3078,7 +3340,8 @@ _PG_init(void)
 
 void _PG_fini(void)
 {
-	set_rel_pathlist_hook = NULL;
+	/* 在drop extension时还原set_rel_pathlist_hook */
+	set_rel_pathlist_hook = set_rel_pathlist_next;
 }
 
 #ifdef __cplusplus
